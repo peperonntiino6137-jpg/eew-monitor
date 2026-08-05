@@ -210,19 +210,21 @@ class Aggregator:
 
             # コンソール表示の間引き: >30s は10秒毎 / >5s は5秒毎 / それ以下は毎秒
             r = int(remaining)
+            # 複数地震の同時進行時に区別できるよう震源名を付ける
+            hypo = st.latest.hypocenter if st.latest else ""
             if remaining <= 0:
                 if not arrived_shown:
                     arrived_shown = True
                     display.log_system(
-                        f"{display.WHITE_ON_RED}[{self.home_name}] S波到達 "
-                        f"(予想震度 {est.intensity_label}){display.RESET}")
+                        f"{display.WHITE_ON_RED}[{self.home_name}] {hypo}の地震の"
+                        f"S波到達 (予想震度 {est.intensity_label}){display.RESET}")
                 continue
             show = (r <= 5) or (r <= 30 and r % 5 == 0) or (r % 10 == 0)
             if show and r != last_shown:
                 last_shown = r
                 color = display.RED if r <= 10 else display.YELLOW
                 display.log_system(
-                    f"{color}[{self.home_name}] S波到達まで 約{r}秒 "
+                    f"{color}[{self.home_name}] {hypo}: S波到達まで 約{r}秒 "
                     f"/ 予想震度 {est.intensity_label}(暫定){display.RESET}")
 
     # ------------------------------------------------------------------- EEW

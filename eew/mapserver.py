@@ -76,8 +76,8 @@ class MapServer:
         self._visible: dict = {}           # ws -> タブが画面に見えているか
         self._httpd: ThreadingHTTPServer | None = None
         self._ws_server = None
-        self._last_eew: dict | None = None
-        self._last_eew_at: float = 0.0     # 再送の鮮度管理 (monotonic)
+        # 進行中の全 EEW を保持 (複数地震の同時進行に対応)
+        self._active_eew: dict[str, tuple[dict, float]] = {}  # id -> (payload, monotonic)
         self._last_tsunami: dict | None = None
         self._last_tsunami_at: float = 0.0
         self._last_open_at: float = -1e9   # タブ増殖防止デバウンス (monotonic)
@@ -130,10 +130,11 @@ class MapServer:
             await ws.send(json.dumps(
                 {**self._init_payload, "server_now": now_jst().isoformat()},
                 ensure_ascii=False))
-            # 直近 EEW の再送は鮮度内のみ (古い速報を「現在」と誤認させない)
-            if (self._last_eew is not None
-                    and time.monotonic() - self._last_eew_at < REPLAY_MAX_AGE_SEC):
-                await ws.send(json.dumps(self._last_eew, ensure_ascii=False))
+            # 進行中の全 EEW を再送 (鮮度内のみ。古い速報を「現在」と誤認させない)
+            now = time.monotonic()
+            for payload, ts in sorted(self._active_eew.values(), key=lambda x: x[1]):
+                if now - ts < REPLAY_MAX_AGE_SEC:
+                    await ws.send(json.dumps(payload, ensure_ascii=False))
             # 発表中の津波予報も再送 (津波で開いたタブにバナーを出すため)
             if (self._last_tsunami is not None
                     and time.monotonic() - self._last_tsunami_at
@@ -169,8 +170,15 @@ class MapServer:
     def broadcast(self, payload: dict) -> None:
         """Aggregator から同期呼び出しされる。同一イベントループ上で送信タスク化。"""
         if payload.get("type") == "eew":
-            self._last_eew = payload
-            self._last_eew_at = time.monotonic()
+            eid = str(payload.get("event_id") or "")
+            now = time.monotonic()
+            if payload.get("is_cancel"):
+                self._active_eew.pop(eid, None)
+            else:
+                self._active_eew[eid] = (payload, now)
+            # 期限切れイベントを間引く
+            self._active_eew = {k: v for k, v in self._active_eew.items()
+                                if now - v[1] < REPLAY_MAX_AGE_SEC}
             home_rank = (payload.get("home") or {}).get("rank", -1)
             urgent = (payload.get("is_warn")
                       or home_rank >= self.open_min_home_rank)

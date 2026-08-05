@@ -17,9 +17,6 @@
   }
   #panel.warn { border: 2px solid #ff3b30; animation: flash 1s infinite; }
   @keyframes flash { 50% { box-shadow: 0 0 24px rgba(255,59,48,.8); } }
-  #status { font-size: 13px; color: #8a8f98; }
-  #status .ok { color: #4cd964; }
-  #status .ng { color: #ff9500; }
   #title { font-size: 17px; font-weight: bold; margin: 6px 0; }
   #title .warn-label { color: #fff; background: #d70015; padding: 1px 8px; border-radius: 4px; }
   #title .forecast-label { color: #111; background: #ffcc00; padding: 1px 8px; border-radius: 4px; }
@@ -66,6 +63,10 @@
   }
   #clock-time { font-size: 28px; font-weight: bold; font-variant-numeric: tabular-nums;
                 letter-spacing: 1px; line-height: 1.2; }
+  /* 接続状態ランプ: 緑=受信中, 赤=切断 */
+  #conn-dot { display: inline-block; width: 13px; height: 13px; border-radius: 50%;
+              margin-right: 10px; vertical-align: middle; background: #ff453a; }
+  #conn-dot.ok { background: #34c759; }
   #clock-date { font-size: 12px; color: #8a8f98; }
   #clock-src  { font-size: 10px; color: #6b7078; }
   /* 観測震度の凡例 */
@@ -85,7 +86,7 @@
 <div id="map"></div>
 <div id="tsunami-banner"></div>
 <div id="clock">
-  <div id="clock-time">--:--:--</div>
+  <div id="clock-time"><span id="conn-dot"></span><span id="clock-time-text">--:--:--</span></div>
   <div id="clock-date"></div>
   <div id="clock-src">日本標準時 (NICT同期)</div>
 </div>
@@ -94,7 +95,6 @@
   <div class="row" id="legend-row"></div>
 </div>
 <div id="panel">
-  <div id="status">サーバ接続中…</div>
   <div id="title">待機中</div>
   <div id="detail">緊急地震速報を受信するとここに表示されます。</div>
   <div id="verdict"></div>
@@ -176,17 +176,17 @@ function onIntensityGrid(msg) {
 }
 
 const $ = id => document.getElementById(id);
-let home = null, homeMarker = null;
-let epiMarker = null, pCircle = null, sCircle = null, gmMarker = null;
-let current = null;              // 最新の EEW payload
-let currentEventId = null;
-let animTimer = null;
+let home = null, homeMarker = null, gmMarker = null;
 let sock = null;                 // WebSocket (自宅設定の送信用)
 let homeSetByUser = false;       // 設定直後はビューを動かさない
 let clockOffset = 0;             // serverNow - Date.now() (PC時計ズレ補正)
-let warnedEventId = null;        // 前面誘導 (通知/点滅/音) はイベントごとに1回
-let fittedFor = null;            // fitBounds 済みイベント (視点ジャンプ抑制)
-let lastServerRemaining = null;  // {value, at} サーバ由来の残秒 (自宅未設定時の代替)
+const warnedEvents = new Set(); // 前面誘導 (通知/点滅/音) はイベントごとに1回
+let animTimer = null;
+
+// 複数地震の同時進行に対応: event_id ごとに状態とレイヤーを持つ
+// ev = { msg, epiMarker, pCircle, sCircle, serverRemaining, fitted }
+const events = new Map();
+let selectedId = null;           // パネルに表示中のイベント (最も切迫したもの)
 
 const nowMs = () => Date.now() + clockOffset;
 
@@ -196,7 +196,7 @@ function renderClock() {
   // JST (UTC+9) を明示的に組み立てる (クライアントのタイムゾーンに依存しない)
   const d = new Date(nowMs() + 9 * 3600 * 1000);
   const p2 = n => String(n).padStart(2, "0");
-  document.getElementById("clock-time").textContent =
+  document.getElementById("clock-time-text").textContent =
     `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`;
   document.getElementById("clock-date").textContent =
     `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} (${WEEKDAYS[d.getUTCDay()]})`;
@@ -251,17 +251,44 @@ map.on("contextmenu", e => {
 });
 
 function setStatus(ok) {
-  $("status").innerHTML = ok
-    ? '<span class="ok">●</span> 受信中'
-    : '<span class="ng">●</span> 切断 - 再接続中…';
+  // 時計左のランプ: 緑=受信中, 赤=切断
+  $("conn-dot").classList.toggle("ok", !!ok);
 }
 
-function clearEvent() {
-  [epiMarker, pCircle, sCircle].forEach(l => l && map.removeLayer(l));
-  epiMarker = pCircle = sCircle = null;
-  if (animTimer) { cancelAnimationFrame(animTimer); animTimer = null; }
-  currentEventId = null; fittedFor = null; lastServerRemaining = null;
-  stopTitleFlash();
+function dropEvent(id) {
+  const ev = events.get(id);
+  if (ev) {
+    [ev.epiMarker, ev.pCircle, ev.sCircle].forEach(l => l && map.removeLayer(l));
+    events.delete(id);
+  }
+  if (selectedId === id) selectedId = null;
+  if (events.size === 0) {
+    if (animTimer) { cancelAnimationFrame(animTimer); animTimer = null; }
+    stopTitleFlash();
+  }
+}
+
+function sRemainingOf(ev) {
+  if (ev.msg.home && ev.msg.home.s_arrival) {
+    return (new Date(ev.msg.home.s_arrival).getTime() - nowMs()) / 1000;
+  }
+  if (ev.serverRemaining) {
+    return ev.serverRemaining.value - (Date.now() - ev.serverRemaining.at) / 1000;
+  }
+  return null;
+}
+
+// パネルに出すイベントを選ぶ: S波が未到達で最も早く来るもの > 最新の地震
+function selectEvent() {
+  let approaching = null, aR = Infinity, newest = null, nT = -Infinity;
+  for (const [id, ev] of events) {
+    const r = sRemainingOf(ev);
+    if (r !== null && r > 0 && r < aR) { aR = r; approaching = id; }
+    const t = ev.msg.origin_time ? new Date(ev.msg.origin_time).getTime() : 0;
+    if (t > nT) { nT = t; newest = id; }
+  }
+  selectedId = approaching || newest;
+  return selectedId;
 }
 
 function onInit(msg) {
@@ -270,70 +297,58 @@ function onInit(msg) {
     if (homeMarker) map.removeLayer(homeMarker);
     homeMarker = L.marker([home.latitude, home.longitude], { title: home.name })
       .addTo(map).bindPopup(home.name || "自宅");
-    if (!homeSetByUser && !current) map.setView([home.latitude, home.longitude], 9);
+    if (!homeSetByUser && events.size === 0) {
+      map.setView([home.latitude, home.longitude], 9);
+    }
     homeSetByUser = false;
   }
 }
 
-// ---- P/S波円: 円オブジェクトは使い回し、rAF+時計補正で滑らかに拡大 ----
+// ---- P/S波円: 全イベント分を rAF+時計補正で滑らかに拡大 ----
 function animateWaves() {
   const step = () => {
     animTimer = requestAnimationFrame(step);
-    if (!current || !current.origin_time || current.latitude == null) return;
-    const elapsed = (nowMs() - new Date(current.origin_time).getTime()) / 1000;
-    if (elapsed <= 0 || elapsed > 900) return;
-    const rp = VP * elapsed * 1000, rs = VS * elapsed * 1000; // m
-    const ll = [current.latitude, current.longitude];
-    if (!pCircle) {
-      pCircle = L.circle(ll, { renderer: waveRenderer, radius: rp, color: "#4da6ff",
-                               weight: 1.5, fill: false, dashArray: "4 4" }).addTo(map);
-      sCircle = L.circle(ll, { renderer: waveRenderer, radius: rs, color: "#ff453a",
-                               weight: 2.5, fillColor: "#ff453a", fillOpacity: 0.12 }).addTo(map);
-    } else {
-      pCircle.setRadius(rp); sCircle.setRadius(rs);
-      const c = pCircle.getLatLng();
-      if (Math.abs(c.lat - ll[0]) > 1e-6 || Math.abs(c.lng - ll[1]) > 1e-6) {
-        pCircle.setLatLng(ll); sCircle.setLatLng(ll);
+    for (const ev of events.values()) {
+      const m = ev.msg;
+      if (!m.origin_time || m.latitude == null) continue;
+      const elapsed = (nowMs() - new Date(m.origin_time).getTime()) / 1000;
+      if (elapsed <= 0 || elapsed > 900) continue;
+      const rp = VP * elapsed * 1000, rs = VS * elapsed * 1000; // m
+      const ll = [m.latitude, m.longitude];
+      if (!ev.pCircle) {
+        ev.pCircle = L.circle(ll, { renderer: waveRenderer, radius: rp, color: "#4da6ff",
+                                    weight: 1.5, fill: false, dashArray: "4 4" }).addTo(map);
+        ev.sCircle = L.circle(ll, { renderer: waveRenderer, radius: rs, color: "#ff453a",
+                                    weight: 2.5, fillColor: "#ff453a", fillOpacity: 0.12 }).addTo(map);
+      } else {
+        ev.pCircle.setRadius(rp); ev.sCircle.setRadius(rs);
+        const c = ev.pCircle.getLatLng();
+        if (Math.abs(c.lat - ll[0]) > 1e-6 || Math.abs(c.lng - ll[1]) > 1e-6) {
+          ev.pCircle.setLatLng(ll); ev.sCircle.setLatLng(ll);
+        }
       }
     }
   };
   if (!animTimer) step();
 }
 
-function onEEW(msg) {
-  noteServerNow(msg);
-  const isNewEvent = msg.event_id !== currentEventId;
-  if (isNewEvent) {
-    // 前のイベントの表示をリセット (円・カウントダウンの凍結防止)
-    if (currentEventId !== null) clearEvent();
-    currentEventId = msg.event_id;
+// ---- パネル描画: 最も切迫したイベントを表示 ----
+function renderPanel() {
+  const id = selectEvent();
+  if (!id) {
+    $("title").textContent = "待機中";
+    $("detail").textContent = "緊急地震速報を受信するとここに表示されます。";
+    $("verdict").style.display = "none";
     $("countdown-box").style.display = "none";
     $("countdown").textContent = "--";
     $("home-int-big").textContent = "-";
-    $("home-int").textContent = "";
-    $("verdict").style.display = "none";
-  }
-  current = msg;
-
-  const panel = $("panel");
-  const kind = msg.is_warn
-    ? '<span class="warn-label">警報</span>' : '<span class="forecast-label">予報</span>';
-  panel.classList.toggle("warn", !!msg.is_warn && !msg.is_cancel);
-
-  if (msg.is_cancel) {
-    $("title").innerHTML = `緊急地震速報 ${kind} <b>取消</b>`;
-    $("detail").textContent = "この速報は取り消されました。";
-    $("countdown-box").style.display = "none";
-    $("areas").textContent = "";
-    clearEvent(); current = null;
+    $("panel").classList.remove("warn");
     return;
   }
-
-  if (msg.is_warn && warnedEventId !== msg.event_id) {
-    warnedEventId = msg.event_id;
-    alertAttention(msg);
-  }
-
+  const msg = events.get(id).msg;
+  const kind = msg.is_warn
+    ? '<span class="warn-label">警報</span>' : '<span class="forecast-label">予報</span>';
+  $("panel").classList.toggle("warn", !!msg.is_warn);
   $("title").innerHTML = `緊急地震速報 ${kind} 第${msg.serial}報${msg.is_final ? "(最終)" : ""}`;
   // 詳細は1行に圧縮 (緊急時に読むものではない)
   const parts = [];
@@ -361,66 +376,87 @@ function onEEW(msg) {
     $("countdown-box").style.display = "block";
     $("home-int-big").textContent = msg.home.intensity_label;
     $("home-int").textContent =
-      `暫定値・±数秒の目安 / 震央距離${msg.home.epicentral_km}km`;
+      `${msg.hypocenter || ""} / 震央距離${msg.home.epicentral_km}km / 暫定値・±数秒の目安`;
+  }
+}
+
+function onEEW(msg) {
+  noteServerNow(msg);
+  if (msg.is_cancel) {
+    dropEvent(msg.event_id);
+    renderPanel();
+    return;
+  }
+  let ev = events.get(msg.event_id);
+  if (!ev) {
+    ev = { msg, epiMarker: null, pCircle: null, sCircle: null,
+           serverRemaining: null, fitted: false };
+    events.set(msg.event_id, ev);
+  }
+  ev.msg = msg;
+
+  if (msg.is_warn && !warnedEvents.has(msg.event_id)) {
+    warnedEvents.add(msg.event_id);
+    alertAttention(msg);
   }
 
   if (msg.latitude != null && msg.longitude != null) {
     const ll = [msg.latitude, msg.longitude];
-    if (!epiMarker) {
-      epiMarker = L.marker(ll, {
+    if (!ev.epiMarker) {
+      ev.epiMarker = L.marker(ll, {
         icon: L.divIcon({ className: "epi-icon", html: "✕", iconSize: [30, 30] })
       }).addTo(map);
     } else {
-      epiMarker.setLatLng(ll);
+      ev.epiMarker.setLatLng(ll);
     }
-    // 視点合わせはイベントごとに1回だけ (続報での画面ジャンプ防止)。
-    // 震央が大きく改定されたときのみ再フィット。
-    const moved = fittedFor && fittedFor.id === msg.event_id
-      ? Math.hypot(fittedFor.lat - ll[0], fittedFor.lon - ll[1]) : Infinity;
-    if (moved > 0.5) {
-      if (home && home.latitude != null) {
-        map.fitBounds(L.latLngBounds([ll, [home.latitude, home.longitude]]).pad(0.35));
-      } else {
-        map.setView(ll, 7);
-      }
-      fittedFor = { id: msg.event_id, lat: ll[0], lon: ll[1] };
+    // 視点合わせはイベントの初回のみ。全イベント + 自宅が入る範囲へ
+    if (!ev.fitted) {
+      const pts = [...events.values()]
+        .filter(e => e.msg.latitude != null)
+        .map(e => [e.msg.latitude, e.msg.longitude]);
+      if (home && home.latitude != null) pts.push([home.latitude, home.longitude]);
+      if (pts.length > 1) map.fitBounds(L.latLngBounds(pts).pad(0.3));
+      else map.setView(ll, 7);
+      ev.fitted = true;
     }
     animateWaves();
   }
+  renderPanel();
 }
 
-// ---- カウントダウン: ローカルで毎 200ms 自走 + サーバ値で補正 ----
-function renderCountdown() {
-  if (!current || current.is_cancel) return;
-  let remaining = null;
-  if (current.home && current.home.s_arrival) {
-    remaining = (new Date(current.home.s_arrival).getTime() - nowMs()) / 1000;
-  } else if (lastServerRemaining) {
-    remaining = lastServerRemaining.value - (Date.now() - lastServerRemaining.at) / 1000;
+// ---- カウントダウン: ローカルで毎 200ms 自走 + 期限切れイベント整理 ----
+function tick() {
+  for (const [id, ev] of [...events]) {
+    const t = ev.msg.origin_time ? new Date(ev.msg.origin_time).getTime() : null;
+    const r = sRemainingOf(ev);
+    if ((t !== null && nowMs() - t > 900000) || (r !== null && r < -180)) {
+      dropEvent(id);
+      renderPanel();
+    }
   }
+  const prev = selectedId;
+  const id = selectEvent();
+  if (id !== prev) renderPanel();  // 切迫イベントの入れ替わりでパネル更新
+  if (!id) return;
+  const remaining = sRemainingOf(events.get(id));
   if (remaining === null) return;
   const box = $("countdown-box"), cd = $("countdown");
   box.style.display = "block";
   if (remaining > 0) {
     cd.classList.remove("arrived");
     cd.textContent = Math.ceil(remaining);
-  } else if (remaining > -180) {
+  } else {
     cd.classList.add("arrived");
     cd.textContent = "到達";
-  } else {
-    box.style.display = "none";  // 到達からしばらく経ったら消す
   }
 }
-setInterval(renderCountdown, 200);
+setInterval(tick, 200);
 
 function onCountdown(msg) {
   noteServerNow(msg);
-  if (!current || msg.event_id !== current.event_id) return;
-  lastServerRemaining = { value: msg.s_remaining, at: Date.now() };
-  if (msg.intensity_label && (!current.home || !current.home.s_arrival)) {
-    $("countdown-box").style.display = "block";
-    $("home-int-big").textContent = msg.intensity_label;
-  }
+  const ev = events.get(msg.event_id);
+  if (!ev) return;
+  ev.serverRemaining = { value: msg.s_remaining, at: Date.now() };
 }
 
 // ---- 津波警報バナー ----
