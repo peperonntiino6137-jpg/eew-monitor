@@ -32,7 +32,9 @@ from .kmoni import IMAGE_URL, POLL_INTERVAL, TIME_JUMP_THRESHOLD, KmoniClient
 POINTS_PATH = Path(__file__).resolve().parent.parent / "data" / "intensity-points.json"
 
 GRID_MIN_INTENSITY = 0.5   # 震度1未満 (震度0) は地図に表示しない
-GRID_MAX_POINTS = 400      # 1回の配信で送る観測点の上限 (震度の高い順)
+# 上限は全観測点数より大きく取る。巨大地震で強震域だけに枠を使い切ると
+# 遠方 (震度3-4) の地点が表示されなくなるため、実質無制限にする
+GRID_MAX_POINTS = 2000
 
 
 def load_points() -> list[dict]:

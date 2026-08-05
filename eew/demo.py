@@ -158,7 +158,8 @@ class GridSim:
                     pts.append([round(p["lat"], 3), round(p["lon"], 3),
                                 round(min(best, 7.0), 1)])
             pts.sort(key=lambda x: -x[2])
-            self.mapsrv.broadcast({"type": "intensity_grid", "points": pts[:400]})
+            # 上限なし: 巨大地震でも遠方の弱い揺れ (震度1-4) まで全点表示する
+            self.mapsrv.broadcast({"type": "intensity_grid", "points": pts})
         self.mapsrv.broadcast({"type": "intensity_grid", "points": []})
 
 
