@@ -137,17 +137,30 @@ class P2PSource:
 
         summary = " / ".join(f"{g}: {'、'.join(names[:6])}" for g, names in grades.items())
         display.log(SOURCE, f"{display.WHITE_ON_RED}【津波予報】{display.RESET} {summary}")
+
+        # 行動指示は段階で変える (注意報に「高台へ避難」は過剰)
+        def _action(grade):
+            return ("海岸や川から離れてください" if grade == "津波注意報"
+                    else "ただちに海岸・川から離れて高台へ避難してください")
+
         if home_grade:
             display.log_system(
                 f"{display.WHITE_ON_RED}【{home_pref}の沿岸に{home_grade}】"
-                f"海岸・川から離れて高台へ{display.RESET}")
+                f"{_action(home_grade)}{display.RESET}")
             notifier.toast(f"{home_grade} - あなたの地域が対象です",
-                           "ただちに海岸・川から離れて高台へ避難してください",
-                           urgent=True, enabled=self.ncfg.get("toast_enabled", True))
+                           _action(home_grade),
+                           urgent=home_grade != "津波注意報",
+                           enabled=self.ncfg.get("toast_enabled", True))
         else:
             notifier.toast("津波予報 (他地域)", summary or "津波予報が発表されました",
                            urgent=False, enabled=self.ncfg.get("toast_enabled", True))
-        notifier.play_sound("tsunami", self.ncfg.get("sound_enabled", True))
+
+        # 音も段階で変える: 警報級=津波音 / 注意報のみ=チャイム音
+        top = next((g for g in ("大津波警報", "津波警報", "津波注意報") if g in grades),
+                   "津波注意報")
+        effective = home_grade or top
+        kind = "tsunami" if effective in ("大津波警報", "津波警報") else "tsunami_watch"
+        notifier.play_sound(kind, self.ncfg.get("sound_enabled", True))
         self.publish({"type": "tsunami", "cancelled": False, "grades": grades,
                       "home_grade": home_grade})
 

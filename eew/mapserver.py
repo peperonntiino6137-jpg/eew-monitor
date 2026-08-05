@@ -190,9 +190,9 @@ class MapServer:
             else:
                 self._last_tsunami = payload
                 self._last_tsunami_at = time.monotonic()
-                # 自宅地域が津波警報以上の対象なら地図を開く
-                # (注意報はバナー表示のみ。遠地津波など EEW を伴わないケースに対応)
-                if payload.get("home_grade") in ("大津波警報", "津波警報"):
+                # 自宅地域が津波予報の対象 (注意報含む) なら地図を開く
+                # (遠地津波など EEW を伴わないケースにも対応)
+                if payload.get("home_grade"):
                     self.maybe_open_on_warning()
         if not self._clients:
             return

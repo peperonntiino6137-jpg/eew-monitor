@@ -9,6 +9,7 @@
             "warning": "sounds/warning.wav",
             "forecast": "sounds/forecast.wav",
             "tsunami": "sounds/tsunami.wav",
+            "tsunami_watch": "sounds/tsunami_watch.wav",
             "info": "sounds/info.wav"
         }
     },

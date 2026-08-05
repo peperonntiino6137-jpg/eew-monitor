@@ -52,6 +52,7 @@
     font-weight: bold; box-shadow: 0 4px 20px rgba(0,0,0,.6);
     animation: flash 1s infinite;
   }
+  #tsunami-banner { cursor: pointer; }
   #tsunami-banner .head { font-size: 22px; }
   #tsunami-banner .areas { font-size: 13px; font-weight: normal; margin-top: 4px; }
   /* 現在時刻 (日本標準時) */
@@ -80,6 +81,7 @@
   #legend .row { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
   #legend .chip { width: 52px; height: 34px; border-radius: 6px; text-align: center;
                   line-height: 34px; font-weight: bold; font-size: 17px; }
+  #legend .chip.wide { width: auto; padding: 0 12px; }
 </style>
 </head>
 <body>
@@ -91,7 +93,7 @@
   <div id="clock-src">日本標準時 (NICT同期)</div>
 </div>
 <div id="legend">
-  観測震度 (強震モニタ)
+  <span id="legend-title">観測震度 (強震モニタ)</span>
   <div class="row" id="legend-row"></div>
 </div>
 <div id="panel">
@@ -128,9 +130,11 @@ L.control.zoom({ position: "bottomright" }).addTo(map);
 // 暗い海 + 濃灰の陸 + 細い県境 — 震度の色と円が最も際立つ
 // 専用の下層ペインに置き、観測震度・円・マーカーより必ず下に描画する
 map.createPane("basemap").style.zIndex = 150;
+let japanGeo = null;  // 津波モードの県別色分けにも使う
 fetch("data/japan.geojson")
   .then(r => r.json())
   .then(gj => {
+    japanGeo = gj;
     L.geoJSON(gj, {
       pane: "basemap",
       style: {
@@ -167,18 +171,31 @@ function intColor(v) {
   for (const [min, color] of INT_SCALE) if (v >= min) return color;
   return null;
 }
-// 凡例 (小さい震度 -> 大きい震度 の順に並べる)
-{
+// 凡例: 通常=観測震度 / 津波モード=津波予報の段階
+function renderLegend(mode) {
   const row = document.getElementById("legend-row");
-  [...INT_SCALE].reverse().forEach(([, color, text, label]) => {
+  const title = document.getElementById("legend-title");
+  row.innerHTML = "";
+  const add = (color, text, label, wide) => {
     const chip = document.createElement("div");
-    chip.className = "chip";
+    chip.className = wide ? "chip wide" : "chip";
     chip.style.background = color;
     chip.style.color = text;
     chip.textContent = label;
     row.appendChild(chip);
-  });
+  };
+  if (mode === "tsunami") {
+    title.textContent = "津波予報";
+    add("#F6D500", "#111", "津波注意報", true);
+    add("#E60012", "#fff", "津波警報", true);
+    add("#FF00FF", "#fff", "大津波警報", true);
+  } else {
+    title.textContent = "観測震度 (強震モニタ)";
+    [...INT_SCALE].reverse().forEach(([, color, text, label]) =>
+      add(color, text, label, false));
+  }
 }
+renderLegend("intensity");
 const intensityLayer = L.layerGroup().addTo(map);
 function onIntensityGrid(msg) {
   intensityLayer.clearLayers();
@@ -197,6 +214,7 @@ let home = null, homeMarker = null, gmMarker = null;
 let sock = null;                 // WebSocket (自宅設定の送信用)
 let homeSetByUser = false;       // 設定直後はビューを動かさない
 let clockOffset = 0;             // serverNow - Date.now() (PC時計ズレ補正)
+let disconnectedAt = null;       // 切断時刻 (古い表示の自動クリア用)
 const warnedEvents = new Set(); // 前面誘導 (通知/点滅/音) はイベントごとに1回
 let animTimer = null;
 
@@ -270,6 +288,7 @@ map.on("contextmenu", e => {
 function setStatus(ok) {
   // 時計左のランプ: 緑=受信中, 赤=切断
   $("conn-dot").classList.toggle("ok", !!ok);
+  disconnectedAt = ok ? null : (disconnectedAt || Date.now());
 }
 
 function dropEvent(id) {
@@ -325,6 +344,7 @@ function onInit(msg) {
 function animateWaves() {
   const step = () => {
     animTimer = requestAnimationFrame(step);
+    if (tsunamiMode) return;  // 津波モード中は円を描かない
     for (const ev of events.values()) {
       const m = ev.msg;
       if (!m.origin_time || m.latitude == null) continue;
@@ -443,6 +463,7 @@ map.on("zoomstart dragstart", () => {
 });
 
 function autoFit(force = false) {
+  if (tsunamiMode) return;  // 津波モード中は津波地図の縮尺を維持
   if (events.size === 0) return;
   if (!force && Date.now() - lastUserInteract < 20000) return;
   const pts = [];
@@ -470,6 +491,16 @@ setInterval(autoFit, 2000);
 
 // ---- カウントダウン: ローカルで毎 200ms 自走 + 期限切れイベント整理 ----
 function tick() {
+  // 切断が30秒続いたら表示を全クリア (再接続すればサーバから最新が再送される)
+  if (disconnectedAt && Date.now() - disconnectedAt > 30000) {
+    lastTsunami = null;
+    if (tsunamiMode) exitTsunamiMode();
+    $("tsunami-banner").style.display = "none";
+    if (events.size > 0) {
+      for (const id of [...events.keys()]) dropEvent(id);
+      renderPanel();
+    }
+  }
   for (const [id, ev] of [...events]) {
     const t = ev.msg.origin_time ? new Date(ev.msg.origin_time).getTime() : null;
     const r = sRemainingOf(ev);
@@ -503,28 +534,131 @@ function onCountdown(msg) {
   ev.serverRemaining = { value: msg.s_remaining, at: Date.now() };
 }
 
-// ---- 津波警報バナー ----
-// 最上位の警報種別で配色: 大津波警報=紫, 津波警報=赤, 津波注意報=黄
+// ---- 津波警報バナー / 津波モード ----
+// バナー配色: 大津波警報=紫, 津波警報=赤, 津波注意報=黄
 const TSUNAMI_STYLE = {
   "大津波警報": { bg: "#B000B0", fg: "#fff" },
   "津波警報":   { bg: "#D70015", fg: "#fff" },
   "津波注意報": { bg: "#F6D500", fg: "#111" },
 };
+// 津波モードの沿岸配色: 注意報=黄, 警報=赤, 大津波警報=マゼンタ (震度7と同格)
+const TSUNAMI_COAST_COLOR = {
+  "津波注意報": "#F6D500",
+  "津波警報":   "#E60012",
+  "大津波警報": "#FF00FF",
+};
+let lastTsunami = null;    // 直近の津波ペイロード
+let tsunamiMode = false;   // 津波専用地図の表示中か
+let tsunamiLayer = null;
+
+// 気象庁の津波予報区 (沿岸線データ)。予報区名で正確に一致させる
+let tsunamiGeo = null;
+fetch("data/tsunami_areas.geojson")
+  .then(r => r.json())
+  .then(gj => { tsunamiGeo = gj; })
+  .catch(() => {});
+
+function buildTsunamiLayer() {
+  if (!tsunamiGeo || !lastTsunami) return null;
+  const layer = L.layerGroup();
+  // 低い警報から描き、高い警報の線が上に来るようにする
+  for (const grade of ["津波注意報", "津波警報", "大津波警報"]) {
+    const areas = lastTsunami.grades[grade] || [];
+    if (!areas.length) continue;
+    const feats = tsunamiGeo.features.filter(ft => {
+      const n = ft.properties.name || "";
+      // 発表名は気象庁の予報区名そのもの (完全一致優先、次いで部分一致)
+      return areas.some(a => n === a || n.includes(a) || a.includes(n));
+    });
+    if (!feats.length) continue;
+    L.geoJSON({ type: "FeatureCollection", features: feats }, {
+      style: { color: TSUNAMI_COAST_COLOR[grade], weight: 6,
+               opacity: 0.95, lineCap: "round" },
+      interactive: false,
+    }).addTo(layer);
+  }
+  return layer;
+}
+
+function setEventLayersVisible(visible) {
+  for (const ev of events.values()) {
+    if (!visible) {
+      [ev.epiMarker, ev.pCircle, ev.sCircle].forEach(l => l && map.removeLayer(l));
+      ev.epiMarker = ev.pCircle = ev.sCircle = null;  // 再表示時に描き直される
+    } else if (ev.msg.latitude != null && !ev.epiMarker) {
+      ev.epiMarker = L.marker([ev.msg.latitude, ev.msg.longitude], {
+        icon: L.divIcon({ className: "epi-icon", html: "✕", iconSize: [30, 30] })
+      }).addTo(map);
+    }
+  }
+}
+
+function enterTsunamiMode() {
+  const layer = buildTsunamiLayer();
+  if (!layer) return;
+  tsunamiMode = true;
+  tsunamiLayer = layer.addTo(map);
+  map.removeLayer(intensityLayer);   // 観測震度を隠す
+  setEventLayersVisible(false);      // 円・震央を隠す
+  renderLegend("tsunami");           // 凡例も津波モードへ
+  // 対象予報区が全て入る縮尺へ
+  const bounds = L.latLngBounds([]);
+  layer.eachLayer(g => g.getBounds && bounds.extend(g.getBounds()));
+  if (bounds.isValid()) map.fitBounds(bounds.pad(0.1));
+  renderTsunamiBanner();
+}
+
+function exitTsunamiMode() {
+  tsunamiMode = false;
+  if (tsunamiLayer) { map.removeLayer(tsunamiLayer); tsunamiLayer = null; }
+  intensityLayer.addTo(map);
+  setEventLayersVisible(true);
+  renderLegend("intensity");         // 凡例を観測震度に戻す
+  autoFit(true);
+  renderTsunamiBanner();
+}
+
+document.getElementById("tsunami-banner").addEventListener("click", () => {
+  if (tsunamiMode) exitTsunamiMode();
+  else enterTsunamiMode();
+});
+
 function onTsunami(msg) {
   const b = $("tsunami-banner");
   if (msg.cancelled || !msg.grades || !Object.keys(msg.grades).length) {
+    lastTsunami = null;
+    if (tsunamiMode) exitTsunamiMode();
     b.style.display = "none";
     return;
   }
+  lastTsunami = msg;
+  if (tsunamiMode) {   // 表示中に内容が更新されたら描き直す
+    map.removeLayer(tsunamiLayer);
+    tsunamiLayer = buildTsunamiLayer();
+    if (tsunamiLayer) tsunamiLayer.addTo(map);
+  }
+  renderTsunamiBanner();
+}
+
+function renderTsunamiBanner() {
+  const msg = lastTsunami;
+  const b = $("tsunami-banner");
+  if (!msg) { b.style.display = "none"; return; }
+  const hint = tsunamiMode
+    ? '<div style="font-size:11px;opacity:.8;margin-top:3px">クリックで通常表示に戻る</div>'
+    : '<div style="font-size:11px;opacity:.8;margin-top:3px">クリックで津波地図を表示</div>';
   if (msg.home_grade) {
-    // 自分の地域が対象: 最大級の表示 + 行動指示のみ
+    // 自分の地域が対象: 最大級の表示 + 行動指示のみ (段階で文言を変える)
     const st = TSUNAMI_STYLE[msg.home_grade] || TSUNAMI_STYLE["津波警報"];
+    const action = msg.home_grade === "津波注意報"
+      ? "海岸や川から離れてください"
+      : "ただちに海岸・川から離れて高台へ";
     b.style.background = st.bg;
     b.style.color = st.fg;
-    b.style.animation = "flash 1s infinite";
+    b.style.animation = tsunamiMode ? "none" : "flash 1s infinite";
     b.innerHTML = `<div class="head">この地域に${msg.home_grade}</div>`
       + `<div class="areas" style="font-size:16px;font-weight:bold">`
-      + `ただちに海岸・川から離れて高台へ</div>`;
+      + action + `</div>` + hint;
   } else {
     // 対象外: 控えめな一行のみ (緊急表示を邪魔しない)
     b.style.background = "rgba(44,46,51,.95)";
@@ -532,7 +666,7 @@ function onTsunami(msg) {
     b.style.animation = "none";
     const order = ["大津波警報", "津波警報", "津波注意報"];
     const top = order.find(g => msg.grades[g]);
-    b.innerHTML = `<div style="font-size:14px">${top} 発表中 (この地域は対象外)</div>`;
+    b.innerHTML = `<div style="font-size:14px">${top} 発表中 (この地域は対象外)</div>` + hint;
   }
   b.style.display = "block";
 }
