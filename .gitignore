@@ -1,0 +1,15 @@
+# 個人情報 (自宅座標) を含むためコミットしない。config.example.json を参照
+config.json
+
+# 実行時生成物
+logs/
+__pycache__/
+*.pyc
+
+# 生成物 (scripts/generate_sounds.py 等で再生成可能)
+sounds/mp3/
+sounds/candidates/
+
+# 一時ファイル
+tmp_*.py
+*.log

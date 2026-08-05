@@ -1,0 +1,7 @@
+websockets>=12.0
+httpx>=0.27
+winotify>=1.1
+pillow>=10.0
+winrt-runtime>=3.0
+winrt-Windows.Devices.Geolocation>=3.0
+winrt-Windows.Foundation>=3.0

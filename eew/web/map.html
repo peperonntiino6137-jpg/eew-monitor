@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>緊急地震速報モニタ</title>
+<link rel="stylesheet" href="vendor/leaflet.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #111; font-family: "Yu Gothic UI", "Meiryo", sans-serif; }
+  #map { position: absolute; inset: 0; }
+  /* 情報パネル */
+  #panel {
+    position: absolute; top: 12px; left: 12px; z-index: 1000;
+    background: rgba(20, 22, 28, 0.92); color: #eee;
+    border-radius: 10px; padding: 14px 18px; min-width: 300px; max-width: 380px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.5); border: 1px solid #333;
+  }
+  #panel.warn { border: 2px solid #ff3b30; animation: flash 1s infinite; }
+  @keyframes flash { 50% { box-shadow: 0 0 24px rgba(255,59,48,.8); } }
+  #status { font-size: 13px; color: #8a8f98; }
+  #status .ok { color: #4cd964; }
+  #status .ng { color: #ff9500; }
+  #title { font-size: 17px; font-weight: bold; margin: 6px 0; }
+  #title .warn-label { color: #fff; background: #d70015; padding: 1px 8px; border-radius: 4px; }
+  #title .forecast-label { color: #111; background: #ffcc00; padding: 1px 8px; border-radius: 4px; }
+  #detail { font-size: 13px; line-height: 1.6; color: #b8bcc4; }
+  /* 自分事判定 (最重要表示) */
+  #verdict { display: none; margin-top: 10px; padding: 10px 8px; border-radius: 8px;
+             text-align: center; font-weight: bold; font-size: 21px; }
+  #verdict.hit { background: #d70015; color: #fff; }
+  #verdict.miss { background: #2c2e33; color: #9aa0a6; font-size: 15px; }
+  #countdown-box { display: none; text-align: center; margin-top: 10px; padding: 12px 8px;
+                   background: rgba(0,0,0,.4); border-radius: 8px; }
+  .cd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; align-items: end; }
+  .cd-label { font-size: 13px; color: #8a8f98; }
+  #home-int-big { font-size: 52px; font-weight: bold; color: #ffb340; line-height: 1.1; }
+  #countdown { font-size: 52px; font-weight: bold; color: #ffd60a; line-height: 1.1;
+               font-variant-numeric: tabular-nums; }
+  #countdown.arrived { color: #ff453a; font-size: 34px; }
+  #home-int { font-size: 12px; color: #8a8f98; margin-top: 6px; }
+  #areas { display: none; }
+  #gm-note { font-size: 13px; color: #ffd60a; margin-top: 6px; display: none; }
+  .note { font-size: 11px; color: #6b7078; margin-top: 8px; }
+  .epi-icon { color: #ff3b30; font-size: 30px; font-weight: bold; text-shadow: 0 0 6px #000;
+              line-height: 30px; text-align: center; }
+  .gm-icon { width: 18px; height: 18px; border-radius: 50%; background: rgba(255,204,0,.85);
+             border: 2px solid #ff9500; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { transform: scale(1.6); opacity: .5; } }
+  /* 津波警報バナー */
+  #tsunami-banner {
+    display: none;
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 1100; min-width: 340px; max-width: 60%;
+    border-radius: 10px; padding: 10px 20px; text-align: center;
+    font-weight: bold; box-shadow: 0 4px 20px rgba(0,0,0,.6);
+    animation: flash 1s infinite;
+  }
+  #tsunami-banner .head { font-size: 22px; }
+  #tsunami-banner .areas { font-size: 13px; font-weight: normal; margin-top: 4px; }
+  /* 現在時刻 (日本標準時) */
+  #clock {
+    position: absolute; top: 12px; right: 12px; z-index: 1000;
+    background: rgba(20, 22, 28, 0.92); color: #eee; text-align: center;
+    border-radius: 10px; padding: 8px 16px; border: 1px solid #333;
+    box-shadow: 0 4px 16px rgba(0,0,0,.5);
+  }
+  #clock-time { font-size: 28px; font-weight: bold; font-variant-numeric: tabular-nums;
+                letter-spacing: 1px; line-height: 1.2; }
+  #clock-date { font-size: 12px; color: #8a8f98; }
+  #clock-src  { font-size: 10px; color: #6b7078; }
+  /* 観測震度の凡例 */
+  #legend {
+    position: absolute; bottom: 24px; left: 12px; z-index: 1000;
+    background: rgba(20, 22, 28, 0.92); color: #eee;
+    border-radius: 12px; padding: 14px 18px; border: 1px solid #333;
+    font-size: 16px; font-weight: bold;
+    box-shadow: 0 4px 16px rgba(0,0,0,.5);
+  }
+  #legend .row { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+  #legend .chip { width: 52px; height: 34px; border-radius: 6px; text-align: center;
+                  line-height: 34px; font-weight: bold; font-size: 17px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="tsunami-banner"></div>
+<div id="clock">
+  <div id="clock-time">--:--:--</div>
+  <div id="clock-date"></div>
+  <div id="clock-src">日本標準時 (NICT同期)</div>
+</div>
+<div id="legend">
+  観測震度 (強震モニタ)
+  <div class="row" id="legend-row"></div>
+</div>
+<div id="panel">
+  <div id="status">サーバ接続中…</div>
+  <div id="title">待機中</div>
+  <div id="detail">緊急地震速報を受信するとここに表示されます。</div>
+  <div id="verdict"></div>
+  <div id="countdown-box">
+    <div class="cd-grid">
+      <div>
+        <div class="cd-label">この場所の予想震度</div>
+        <div id="home-int-big">-</div>
+      </div>
+      <div>
+        <div class="cd-label">強い揺れまで(秒)</div>
+        <div id="countdown">--</div>
+      </div>
+    </div>
+    <div id="home-int"></div>
+  </div>
+  <div id="areas"></div>
+  <div id="gm-note"></div>
+  <div class="note">地図を右クリック(長押し)で自宅位置を設定できます。<br>
+    予想震度・到達時刻は暫定値 (±数秒の目安)。防災行動は気象庁の公式情報に従ってください。</div>
+</div>
+<script src="ws_port.js"></script>
+<script src="vendor/leaflet.js"></script>
+<script>
+"use strict";
+const VS = 3.5, VP = 7.0; // km/s
+
+const map = L.map("map", { zoomControl: false }).setView([36.2, 138.2], 5);
+L.control.zoom({ position: "bottomright" }).addTo(map);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+}).addTo(map);
+L.Icon.Default.prototype.options.imagePath = "vendor/images/";
+
+// P/S波円は Canvas レンダラーで毎フレーム更新しても滑らかに描く
+const waveRenderer = L.canvas({ padding: 1.0 });
+
+// ---- 観測震度の配色 (ユーザー指定) ----
+// [しきい値(リアルタイム震度), 塗り色, 文字色, ラベル]
+const INT_SCALE = [
+  [6.5, "#FF00FF", "#fff", "7"],    // 震度7: マゼンタ
+  [6.0, "#8B0000", "#fff", "6強"],  // 6強: ダークレッド
+  [5.5, "#FF2800", "#fff", "6弱"],  // 6弱: 赤
+  [5.0, "#FF9900", "#111", "5強"],  // 5強: オレンジ
+  [4.5, "#F6D500", "#111", "5弱"],  // 5弱: 黄
+  [3.5, "#66CCFF", "#111", "4"],    // 4: 水色
+  [2.5, "#0066CC", "#fff", "3"],    // 3: 青
+  [1.5, "#00897B", "#fff", "2"],    // 2: 青緑
+  [0.5, "#A0A0A0", "#111", "1"],    // 1: 灰色
+];                                  // 0: 表示なし
+function intColor(v) {
+  for (const [min, color] of INT_SCALE) if (v >= min) return color;
+  return null;
+}
+// 凡例 (小さい震度 -> 大きい震度 の順に並べる)
+{
+  const row = document.getElementById("legend-row");
+  [...INT_SCALE].reverse().forEach(([, color, text, label]) => {
+    const chip = document.createElement("div");
+    chip.className = "chip";
+    chip.style.background = color;
+    chip.style.color = text;
+    chip.textContent = label;
+    row.appendChild(chip);
+  });
+}
+const intensityLayer = L.layerGroup().addTo(map);
+function onIntensityGrid(msg) {
+  intensityLayer.clearLayers();
+  for (const [lat, lon, v] of msg.points || []) {
+    const color = intColor(v);
+    if (!color) continue;
+    L.circleMarker([lat, lon], {
+      renderer: waveRenderer, radius: 5,
+      color: "#222", weight: 1, fillColor: color, fillOpacity: 0.9,
+    }).addTo(intensityLayer);
+  }
+}
+
+const $ = id => document.getElementById(id);
+let home = null, homeMarker = null;
+let epiMarker = null, pCircle = null, sCircle = null, gmMarker = null;
+let current = null;              // 最新の EEW payload
+let currentEventId = null;
+let animTimer = null;
+let sock = null;                 // WebSocket (自宅設定の送信用)
+let homeSetByUser = false;       // 設定直後はビューを動かさない
+let clockOffset = 0;             // serverNow - Date.now() (PC時計ズレ補正)
+let warnedEventId = null;        // 前面誘導 (通知/点滅/音) はイベントごとに1回
+let fittedFor = null;            // fitBounds 済みイベント (視点ジャンプ抑制)
+let lastServerRemaining = null;  // {value, at} サーバ由来の残秒 (自宅未設定時の代替)
+
+const nowMs = () => Date.now() + clockOffset;
+
+// ---- 現在時刻 (日本標準時) — サーバの NICT 補正済み時刻に追従 ----
+const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
+function renderClock() {
+  // JST (UTC+9) を明示的に組み立てる (クライアントのタイムゾーンに依存しない)
+  const d = new Date(nowMs() + 9 * 3600 * 1000);
+  const p2 = n => String(n).padStart(2, "0");
+  document.getElementById("clock-time").textContent =
+    `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`;
+  document.getElementById("clock-date").textContent =
+    `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} (${WEEKDAYS[d.getUTCDay()]})`;
+}
+setInterval(renderClock, 200);
+renderClock();
+
+function noteServerNow(msg) {
+  if (msg.server_now) {
+    const off = new Date(msg.server_now).getTime() - Date.now();
+    if (Number.isFinite(off)) clockOffset = off;
+  }
+}
+
+// ---- 前面誘導 (警報時にタブが背面でも気づけるように) ----
+if ("Notification" in window && Notification.permission === "default") {
+  Notification.requestPermission();
+}
+let titleFlashTimer = null;
+function alertAttention(msg) {
+  // ブラウザ通知 (クリックでこのタブへ)
+  if ("Notification" in window && Notification.permission === "granted"
+      && (document.hidden || !document.hasFocus())) {
+    const n = new Notification("緊急地震速報(警報)", {
+      body: `${msg.hypocenter || ""} 最大震度${msg.max_intensity || "不明"} — クリックで地図を表示`,
+      tag: "eew-warn", renotify: true,
+    });
+    n.onclick = () => { window.focus(); n.close(); };
+  }
+  // タブタイトル点滅
+  if (!titleFlashTimer) {
+    let flip = false;
+    titleFlashTimer = setInterval(() => {
+      document.title = (flip = !flip) ? "【緊急地震速報】" : "緊急地震速報モニタ";
+    }, 800);
+    setTimeout(stopTitleFlash, 120000);
+  }
+  // 音はデスクトップ側 (カスタム音源) が担当。ここでは鳴らさない (二重再生防止)
+}
+function stopTitleFlash() {
+  if (titleFlashTimer) { clearInterval(titleFlashTimer); titleFlashTimer = null; }
+  document.title = "緊急地震速報モニタ";
+}
+
+// ---- 自宅設定 (右クリック) ----
+map.on("contextmenu", e => {
+  if (!sock || sock.readyState !== WebSocket.OPEN) return;
+  const { lat, lng } = e.latlng;
+  if (!confirm(`この地点を自宅に設定しますか?\n(${lat.toFixed(4)}, ${lng.toFixed(4)})`)) return;
+  homeSetByUser = true;
+  sock.send(JSON.stringify({ type: "set_home", latitude: lat, longitude: lng }));
+});
+
+function setStatus(ok) {
+  $("status").innerHTML = ok
+    ? '<span class="ok">●</span> 受信中'
+    : '<span class="ng">●</span> 切断 - 再接続中…';
+}
+
+function clearEvent() {
+  [epiMarker, pCircle, sCircle].forEach(l => l && map.removeLayer(l));
+  epiMarker = pCircle = sCircle = null;
+  if (animTimer) { cancelAnimationFrame(animTimer); animTimer = null; }
+  currentEventId = null; fittedFor = null; lastServerRemaining = null;
+  stopTitleFlash();
+}
+
+function onInit(msg) {
+  home = msg.home;
+  if (home && home.latitude != null) {
+    if (homeMarker) map.removeLayer(homeMarker);
+    homeMarker = L.marker([home.latitude, home.longitude], { title: home.name })
+      .addTo(map).bindPopup(home.name || "自宅");
+    if (!homeSetByUser && !current) map.setView([home.latitude, home.longitude], 9);
+    homeSetByUser = false;
+  }
+}
+
+// ---- P/S波円: 円オブジェクトは使い回し、rAF+時計補正で滑らかに拡大 ----
+function animateWaves() {
+  const step = () => {
+    animTimer = requestAnimationFrame(step);
+    if (!current || !current.origin_time || current.latitude == null) return;
+    const elapsed = (nowMs() - new Date(current.origin_time).getTime()) / 1000;
+    if (elapsed <= 0 || elapsed > 900) return;
+    const rp = VP * elapsed * 1000, rs = VS * elapsed * 1000; // m
+    const ll = [current.latitude, current.longitude];
+    if (!pCircle) {
+      pCircle = L.circle(ll, { renderer: waveRenderer, radius: rp, color: "#4da6ff",
+                               weight: 1.5, fill: false, dashArray: "4 4" }).addTo(map);
+      sCircle = L.circle(ll, { renderer: waveRenderer, radius: rs, color: "#ff453a",
+                               weight: 2.5, fillColor: "#ff453a", fillOpacity: 0.12 }).addTo(map);
+    } else {
+      pCircle.setRadius(rp); sCircle.setRadius(rs);
+      const c = pCircle.getLatLng();
+      if (Math.abs(c.lat - ll[0]) > 1e-6 || Math.abs(c.lng - ll[1]) > 1e-6) {
+        pCircle.setLatLng(ll); sCircle.setLatLng(ll);
+      }
+    }
+  };
+  if (!animTimer) step();
+}
+
+function onEEW(msg) {
+  noteServerNow(msg);
+  const isNewEvent = msg.event_id !== currentEventId;
+  if (isNewEvent) {
+    // 前のイベントの表示をリセット (円・カウントダウンの凍結防止)
+    if (currentEventId !== null) clearEvent();
+    currentEventId = msg.event_id;
+    $("countdown-box").style.display = "none";
+    $("countdown").textContent = "--";
+    $("home-int-big").textContent = "-";
+    $("home-int").textContent = "";
+    $("verdict").style.display = "none";
+  }
+  current = msg;
+
+  const panel = $("panel");
+  const kind = msg.is_warn
+    ? '<span class="warn-label">警報</span>' : '<span class="forecast-label">予報</span>';
+  panel.classList.toggle("warn", !!msg.is_warn && !msg.is_cancel);
+
+  if (msg.is_cancel) {
+    $("title").innerHTML = `緊急地震速報 ${kind} <b>取消</b>`;
+    $("detail").textContent = "この速報は取り消されました。";
+    $("countdown-box").style.display = "none";
+    $("areas").textContent = "";
+    clearEvent(); current = null;
+    return;
+  }
+
+  if (msg.is_warn && warnedEventId !== msg.event_id) {
+    warnedEventId = msg.event_id;
+    alertAttention(msg);
+  }
+
+  $("title").innerHTML = `緊急地震速報 ${kind} 第${msg.serial}報${msg.is_final ? "(最終)" : ""}`;
+  // 詳細は1行に圧縮 (緊急時に読むものではない)
+  const parts = [];
+  if (msg.hypocenter) parts.push(msg.hypocenter);
+  if (msg.magnitude != null) parts.push(`M${msg.magnitude.toFixed(1)}`);
+  if (msg.depth_km != null) parts.push(`深さ${msg.depth_km}km`);
+  if (msg.max_intensity) parts.push(`最大震度${msg.max_intensity}`);
+  $("detail").textContent = parts.join(" / ");
+
+  // 自分事判定 (最重要): 警報対象地域に自分がいるか
+  const v = $("verdict");
+  if (msg.in_warn_area === true) {
+    v.className = "hit";
+    v.textContent = `${msg.home_pref || "この地域"}は警報対象です`;
+    v.style.display = "block";
+  } else if (msg.in_warn_area === false) {
+    v.className = "miss";
+    v.textContent = `${msg.home_pref || "この地域"}は警報対象外 (他地域に警報)`;
+    v.style.display = "block";
+  } else {
+    v.style.display = "none";
+  }
+
+  if (msg.home && msg.home.intensity_label) {
+    $("countdown-box").style.display = "block";
+    $("home-int-big").textContent = msg.home.intensity_label;
+    $("home-int").textContent =
+      `暫定値・±数秒の目安 / 震央距離${msg.home.epicentral_km}km`;
+  }
+
+  if (msg.latitude != null && msg.longitude != null) {
+    const ll = [msg.latitude, msg.longitude];
+    if (!epiMarker) {
+      epiMarker = L.marker(ll, {
+        icon: L.divIcon({ className: "epi-icon", html: "✕", iconSize: [30, 30] })
+      }).addTo(map);
+    } else {
+      epiMarker.setLatLng(ll);
+    }
+    // 視点合わせはイベントごとに1回だけ (続報での画面ジャンプ防止)。
+    // 震央が大きく改定されたときのみ再フィット。
+    const moved = fittedFor && fittedFor.id === msg.event_id
+      ? Math.hypot(fittedFor.lat - ll[0], fittedFor.lon - ll[1]) : Infinity;
+    if (moved > 0.5) {
+      if (home && home.latitude != null) {
+        map.fitBounds(L.latLngBounds([ll, [home.latitude, home.longitude]]).pad(0.35));
+      } else {
+        map.setView(ll, 7);
+      }
+      fittedFor = { id: msg.event_id, lat: ll[0], lon: ll[1] };
+    }
+    animateWaves();
+  }
+}
+
+// ---- カウントダウン: ローカルで毎 200ms 自走 + サーバ値で補正 ----
+function renderCountdown() {
+  if (!current || current.is_cancel) return;
+  let remaining = null;
+  if (current.home && current.home.s_arrival) {
+    remaining = (new Date(current.home.s_arrival).getTime() - nowMs()) / 1000;
+  } else if (lastServerRemaining) {
+    remaining = lastServerRemaining.value - (Date.now() - lastServerRemaining.at) / 1000;
+  }
+  if (remaining === null) return;
+  const box = $("countdown-box"), cd = $("countdown");
+  box.style.display = "block";
+  if (remaining > 0) {
+    cd.classList.remove("arrived");
+    cd.textContent = Math.ceil(remaining);
+  } else if (remaining > -180) {
+    cd.classList.add("arrived");
+    cd.textContent = "到達";
+  } else {
+    box.style.display = "none";  // 到達からしばらく経ったら消す
+  }
+}
+setInterval(renderCountdown, 200);
+
+function onCountdown(msg) {
+  noteServerNow(msg);
+  if (!current || msg.event_id !== current.event_id) return;
+  lastServerRemaining = { value: msg.s_remaining, at: Date.now() };
+  if (msg.intensity_label && (!current.home || !current.home.s_arrival)) {
+    $("countdown-box").style.display = "block";
+    $("home-int-big").textContent = msg.intensity_label;
+  }
+}
+
+// ---- 津波警報バナー ----
+// 最上位の警報種別で配色: 大津波警報=紫, 津波警報=赤, 津波注意報=黄
+const TSUNAMI_STYLE = {
+  "大津波警報": { bg: "#B000B0", fg: "#fff" },
+  "津波警報":   { bg: "#D70015", fg: "#fff" },
+  "津波注意報": { bg: "#F6D500", fg: "#111" },
+};
+function onTsunami(msg) {
+  const b = $("tsunami-banner");
+  if (msg.cancelled || !msg.grades || !Object.keys(msg.grades).length) {
+    b.style.display = "none";
+    return;
+  }
+  if (msg.home_grade) {
+    // 自分の地域が対象: 最大級の表示 + 行動指示のみ
+    const st = TSUNAMI_STYLE[msg.home_grade] || TSUNAMI_STYLE["津波警報"];
+    b.style.background = st.bg;
+    b.style.color = st.fg;
+    b.style.animation = "flash 1s infinite";
+    b.innerHTML = `<div class="head">この地域に${msg.home_grade}</div>`
+      + `<div class="areas" style="font-size:16px;font-weight:bold">`
+      + `ただちに海岸・川から離れて高台へ</div>`;
+  } else {
+    // 対象外: 控えめな一行のみ (緊急表示を邪魔しない)
+    b.style.background = "rgba(44,46,51,.95)";
+    b.style.color = "#9aa0a6";
+    b.style.animation = "none";
+    const order = ["大津波警報", "津波警報", "津波注意報"];
+    const top = order.find(g => msg.grades[g]);
+    b.innerHTML = `<div style="font-size:14px">${top} 発表中 (この地域は対象外)</div>`;
+  }
+  b.style.display = "block";
+}
+
+function onGroundMotion(msg) {
+  $("gm-note").style.display = "block";
+  $("gm-note").textContent =
+    `揺れ検知(強震モニタ): ${msg.region}付近 震度${msg.intensity}相当 (${msg.point_count}点)`;
+  if (msg.latitude != null) {
+    if (gmMarker) map.removeLayer(gmMarker);
+    gmMarker = L.marker([msg.latitude, msg.longitude], {
+      icon: L.divIcon({ className: "gm-icon", iconSize: [18, 18] })
+    }).addTo(map).bindPopup(`揺れ検知: ${msg.region}付近`);
+  }
+  setTimeout(() => { $("gm-note").style.display = "none";
+                     if (gmMarker) { map.removeLayer(gmMarker); gmMarker = null; } }, 120000);
+}
+
+// タブの表示状態 (前面/背面) をサーバへ報告する。
+// 「見えているタブが無ければ警報時に新しいタブを開く」判定に使われる。
+function sendVisibility() {
+  if (sock && sock.readyState === WebSocket.OPEN) {
+    sock.send(JSON.stringify({ type: "visibility",
+                               visible: document.visibilityState === "visible" }));
+  }
+}
+document.addEventListener("visibilitychange", sendVisibility);
+
+function connect() {
+  const ws = new WebSocket(`ws://127.0.0.1:${window.WS_PORT || (Number(location.port) + 1)}`);
+  sock = ws;
+  ws.onopen = () => { setStatus(true); sendVisibility(); };
+  ws.onclose = () => { setStatus(false); setTimeout(connect, 3000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = e => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === "init") { noteServerNow(msg); onInit(msg); }
+    else if (msg.type === "eew") onEEW(msg);
+    else if (msg.type === "countdown") onCountdown(msg);
+    else if (msg.type === "ground_motion") onGroundMotion(msg);
+    else if (msg.type === "intensity_grid") onIntensityGrid(msg);
+    else if (msg.type === "tsunami") onTsunami(msg);
+    else if (msg.type === "time") noteServerNow(msg);
+  };
+}
+connect();
+</script>
+</body>
+</html>

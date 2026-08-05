@@ -1,0 +1,43 @@
+{
+    "notify": {
+        "forecast_min_intensity": "3",
+        "alarm_on_warning": true,
+        "toast_enabled": true,
+        "sound_enabled": true,
+        "use_home_intensity": true,
+        "sounds": {
+            "warning": "sounds/warning.wav",
+            "forecast": "sounds/forecast.wav",
+            "tsunami": "sounds/tsunami.wav",
+            "info": "sounds/info.wav"
+        }
+    },
+    "sources": {
+        "wolfx": true,
+        "kmoni": true,
+        "p2p": true
+    },
+    "home": {
+        "auto_locate": true,
+        "name": "",
+        "latitude": null,
+        "longitude": null,
+        "avs30": 300,
+        "method": ""
+    },
+    "map": {
+        "enabled": true,
+        "http_port": 8720,
+        "ws_port": 8721,
+        "open_on_start": true,
+        "open_on_warning": true
+    },
+    "kmoni_image": {
+        "enabled": true,
+        "trigger_intensity": 2.5,
+        "min_points": 3,
+        "cluster_km": 50,
+        "cooldown_seconds": 60
+    },
+    "stale_seconds": 180
+}
