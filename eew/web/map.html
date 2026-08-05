@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="vendor/leaflet.css">
 <style>
   html, body { margin: 0; height: 100%; background: #111; font-family: "Yu Gothic UI", "Meiryo", sans-serif; }
-  #map { position: absolute; inset: 0; }
+  #map { position: absolute; inset: 0; background: #0b0e14; }  /* 海 */
   /* 情報パネル */
   #panel {
     position: absolute; top: 12px; left: 12px; z-index: 1000;
@@ -124,10 +124,27 @@ const VS = 3.5, VP = 7.0; // km/s
 
 const map = L.map("map", { zoomControl: false }).setView([36.2, 138.2], 5);
 L.control.zoom({ position: "bottomright" }).addTo(map);
-L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-}).addTo(map);
+// ベースマップ: タイル不使用。都道府県ポリゴンのみの自前描画 (オフラインでも動く)
+// 暗い海 + 濃灰の陸 + 細い県境 — 震度の色と円が最も際立つ
+// 専用の下層ペインに置き、観測震度・円・マーカーより必ず下に描画する
+map.createPane("basemap").style.zIndex = 150;
+fetch("data/japan.geojson")
+  .then(r => r.json())
+  .then(gj => {
+    L.geoJSON(gj, {
+      pane: "basemap",
+      style: {
+        color: "#4a515c",      // 県境
+        weight: 1,
+        fillColor: "#1a1e24",  // 陸
+        fillOpacity: 1,
+      },
+      interactive: false,
+    }).addTo(map);
+  })
+  .catch(() => {});
+map.attributionControl.setPrefix(false);
+map.attributionControl.addAttribution("地図データ: dataofjapan/land");
 L.Icon.Default.prototype.options.imagePath = "vendor/images/";
 
 // P/S波円は Canvas レンダラーで毎フレーム更新しても滑らかに描く
@@ -388,9 +405,10 @@ function onEEW(msg) {
     return;
   }
   let ev = events.get(msg.event_id);
+  const isNewEvent = !ev;
   if (!ev) {
     ev = { msg, epiMarker: null, pCircle: null, sCircle: null,
-           serverRemaining: null, fitted: false };
+           serverRemaining: null };
     events.set(msg.event_id, ev);
   }
   ev.msg = msg;
@@ -409,20 +427,46 @@ function onEEW(msg) {
     } else {
       ev.epiMarker.setLatLng(ll);
     }
-    // 視点合わせはイベントの初回のみ。全イベント + 自宅が入る範囲へ
-    if (!ev.fitted) {
-      const pts = [...events.values()]
-        .filter(e => e.msg.latitude != null)
-        .map(e => [e.msg.latitude, e.msg.longitude]);
-      if (home && home.latitude != null) pts.push([home.latitude, home.longitude]);
-      if (pts.length > 1) map.fitBounds(L.latLngBounds(pts).pad(0.3));
-      else map.setView(ll, 7);
-      ev.fitted = true;
-    }
+    autoFit(isNewEvent);  // 新イベント時は強制フィット、続報は必要時のみ
     animateWaves();
   }
   renderPanel();
 }
+
+// ---- 縮尺の自動調整 ----
+// 自宅 + 全震央 + 拡大中のS波円が常に画面に収まるよう自動フィット。
+// ユーザーが手動で地図を操作した直後 20 秒間は自動調整しない。
+let lastUserInteract = 0;
+let autoFitting = false;
+map.on("zoomstart dragstart", () => {
+  if (!autoFitting) lastUserInteract = Date.now();
+});
+
+function autoFit(force = false) {
+  if (events.size === 0) return;
+  if (!force && Date.now() - lastUserInteract < 20000) return;
+  const pts = [];
+  for (const ev of events.values()) {
+    const m = ev.msg;
+    if (m.latitude == null) continue;
+    pts.push([m.latitude, m.longitude]);
+    // S波が自宅に未到達の間はその円全体も収める (到達後は追わない)
+    const r = sRemainingOf(ev);
+    if (ev.sCircle && r !== null && r > 0) {
+      const b = ev.sCircle.getBounds();
+      pts.push([b.getNorth(), b.getEast()], [b.getSouth(), b.getWest()]);
+    }
+  }
+  if (home && home.latitude != null) pts.push([home.latitude, home.longitude]);
+  if (pts.length === 0) return;
+  const target = L.latLngBounds(pts).pad(0.1);
+  if (force || !map.getBounds().contains(target)) {
+    autoFitting = true;
+    map.fitBounds(target);
+    setTimeout(() => { autoFitting = false; }, 600);
+  }
+}
+setInterval(autoFit, 2000);
 
 // ---- カウントダウン: ローカルで毎 200ms 自走 + 期限切れイベント整理 ----
 function tick() {

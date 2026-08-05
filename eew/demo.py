@@ -62,6 +62,40 @@ PRESETS = {
             "Watch": ["千葉県九十九里・外房", "小笠原諸島", "有明・八代海"],
         },
     },
+    "hanshin": {
+        "lat": 34.6, "lon": 135.04, "name": "淡路島北部",
+        "warn1": ["兵庫県", "大阪府"],
+        "warn2": ["兵庫県", "大阪府", "京都府", "奈良県", "滋賀県", "和歌山県"],
+        "warn3_extra": ["岡山県", "香川県", "徳島県"],
+        "tsunami": {"Watch": ["大阪湾・播磨灘"]},
+    },
+    "shuto": {
+        "lat": 35.65, "lon": 139.80, "name": "東京都23区直下",
+        "warn1": ["東京都", "神奈川県", "埼玉県", "千葉県"],
+        "warn2": ["東京都", "神奈川県", "埼玉県", "千葉県",
+                  "茨城県", "栃木県", "群馬県", "山梨県", "静岡県"],
+        "warn3_extra": ["長野県", "福島県"],
+        "tsunami": {"Watch": ["東京湾内湾"]},
+    },
+    "noto": {
+        "lat": 37.5, "lon": 137.3, "name": "能登半島沖",
+        "warn1": ["石川県", "富山県", "新潟県"],
+        "warn2": ["石川県", "富山県", "新潟県", "福井県", "長野県", "岐阜県"],
+        "warn3_extra": ["滋賀県", "京都府"],
+        "tsunami": {
+            "MajorWarning": ["石川県能登"],
+            "Warning": ["新潟県上中下越", "富山県", "石川県加賀"],
+            "Watch": ["山形県", "兵庫県北部", "福井県"],
+        },
+    },
+    "kumamoto": {
+        "lat": 32.75, "lon": 130.76, "name": "熊本県熊本地方",
+        "warn1": ["熊本県", "大分県"],
+        "warn2": ["熊本県", "大分県", "福岡県", "佐賀県", "長崎県", "宮崎県",
+                  "鹿児島県"],
+        "warn3_extra": ["山口県", "愛媛県"],
+        "tsunami": {"Watch": ["有明・八代海"]},
+    },
     "sagami": {
         "lat": 35.3, "lon": 139.25, "name": "相模湾",
         "warn1": ["神奈川県", "東京都", "千葉県", "埼玉県", "静岡県"],
@@ -244,36 +278,68 @@ async def amain(mag: float, depth: float, preset_key: str) -> None:
     display.log_system("デモ終了 (地図タブは閉じて構いません)")
 
 
-async def amain_double() -> None:
-    """連発シナリオ: 南海トラフ M9.1 の 20 秒後に三陸沖 M9.1。"""
+MULTI_SCENARIOS = {
+    # (遅延秒, M, 深さ, プリセット, イベントID接尾辞, 津波あり?)
+    "double": [
+        (0,  9.1, 20, "nankai",  "880000", True),
+        (20, 9.1, 30, "sanriku", "770000", False),
+    ],
+    "triple": [
+        (0,  9.1, 20, "nankai",  "880000", True),
+        (20, 9.1, 30, "sanriku", "770000", False),
+        (40, 7.9, 25, "sagami",  "660000", False),  # 最後発だが最初に揺れが来る
+    ],
+    # 歴史的・想定大地震の6連鎖 (実際の地震ではありません)
+    "rensa": [
+        (0,  9.1, 20, "nankai",   "880000", True),   # 南海トラフ巨大地震
+        (12, 9.0, 24, "sanriku",  "770000", False),  # 東日本大震災
+        (24, 7.6, 16, "noto",     "660000", False),  # 能登半島沖地震
+        (36, 7.3, 16, "hanshin",  "550000", False),  # 阪神・淡路大震災
+        (48, 7.3, 12, "kumamoto", "440000", False),  # 熊本地震
+        (60, 7.3, 30, "shuto",    "330000", False),  # 首都直下地震 (直撃で締め)
+    ],
+}
+
+
+async def amain_multi(mode: str) -> None:
+    """連発シナリオ: 複数の地震を時間差で発生させる。"""
+    scenario = MULTI_SCENARIOS[mode]
     display.banner()
-    display.log_system("=== 連発デモ: 紀伊半島南東沖 M9.1 -> 20秒後に三陸沖 M9.1 "
-                       "(実際の地震ではありません) ===", display.YELLOW)
+    seq = " -> ".join(f"{'+' + str(d) + '秒 ' if d else ''}"
+                      f"{PRESETS[k]['name']} M{m:.1f}"
+                      for d, m, _dep, k, _s, _t in scenario)
+    display.log_system(f"=== 連発デモ: {seq} (実際の地震ではありません) ===",
+                       display.YELLOW)
     cfg, mapsrv, agg = await _setup()
     grid = GridSim(mapsrv)
     grid_task = asyncio.create_task(grid.run())
     display.log_system("3秒後に1つ目が発生します")
     await asyncio.sleep(3)
 
-    ev1 = asyncio.create_task(run_event(
-        cfg, mapsrv, agg, 9.1, 20, "nankai", suffix="880000",
-        with_tsunami=True, grid=grid))
-    await asyncio.sleep(20)
-    display.log_system(f"{display.BOLD}=== 2つ目の地震が発生 (三陸沖 M9.1) ==={display.RESET}",
-                       display.YELLOW)
-    ev2 = asyncio.create_task(run_event(
-        cfg, mapsrv, agg, 9.1, 30, "sanriku", suffix="770000",
-        with_tsunami=False,  # 2つ目の津波警報は省略 (発表内容が重複するため)
-        grid=grid))          # 観測震度は両地震の最大値を合成表示
-    await asyncio.gather(ev1, ev2)
+    tasks = []
+    prev_delay = 0
+    for delay, mag, depth, preset_key, suffix, tsunami in scenario:
+        await asyncio.sleep(delay - prev_delay)
+        prev_delay = delay
+        if delay:
+            display.log_system(
+                f"{display.BOLD}=== 次の地震が発生 ({PRESETS[preset_key]['name']} "
+                f"M{mag:.1f}) ==={display.RESET}", display.YELLOW)
+        tasks.append(asyncio.create_task(run_event(
+            cfg, mapsrv, agg, mag, depth, preset_key, suffix=suffix,
+            with_tsunami=tsunami, grid=grid)))
+    await asyncio.gather(*tasks)
     grid_task.cancel()
     display.log_system("連発デモ終了")
 
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "double":
+    if len(sys.argv) > 1 and sys.argv[1] in MULTI_SCENARIOS:
         try:
-            asyncio.run(amain_double())
+            asyncio.run(amain_multi(sys.argv[1]))
+        except OSError as e:
+            print(f"起動失敗: 前のデモがまだ実行中の可能性があります ({e})", flush=True)
+            sys.exit(1)
         except KeyboardInterrupt:
             print("\nデモ中断", flush=True)
         return
@@ -285,6 +351,9 @@ def main() -> None:
         sys.exit(1)
     try:
         asyncio.run(amain(mag, depth, preset))
+    except OSError as e:
+        print(f"起動失敗: 前のデモがまだ実行中の可能性があります ({e})", flush=True)
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nデモ中断", flush=True)
 
