@@ -76,11 +76,17 @@ def pixel_to_intensity(r: int, g: int, b: int) -> float | None:
 
 
 def find_cluster(hits: list[dict], min_points: int, cluster_km: float) -> list[dict] | None:
-    """半径 cluster_km 内に min_points 以上集まる塊を返す (なければ None)。"""
+    """半径 cluster_km 内に min_points 以上集まる塊を返す (なければ None)。
+
+    中心候補は震度上位に絞る (全点を中心にすると O(n^2) で、広域地震時に
+    イベントループを最大0.9秒ブロックすることが実測されたため)。
+    """
     if len(hits) < min_points:
         return None
+    centers = (sorted(hits, key=lambda q: -q["intensity"])[:60]
+               if len(hits) > 60 else hits)
     best = None
-    for center in hits:
+    for center in centers:
         members = [q for q in hits
                    if haversine_km(center["lat"], center["lon"], q["lat"], q["lon"])
                    <= cluster_km]

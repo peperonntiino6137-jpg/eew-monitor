@@ -19,17 +19,29 @@ from ..models import EEWEvent, intensity_rank, now_jst, p2p_scale_label, parse_j
 URL = "wss://api.p2pquake.net/v2/ws"
 SOURCE = "p2p"
 
-_TSUNAMI_GRADE = {"MajorWarning": "大津波警報", "Warning": "津波警報", "Watch": "津波注意報"}
+_TSUNAMI_GRADE = {"MajorWarning": "大津波警報", "Warning": "津波警報",
+                  "Watch": "津波注意報", "Unknown": "津波情報"}
 
 
 def _parse_556(data: dict) -> EEWEvent | None:
     eq = data.get("earthquake") or {}
     hypo = eq.get("hypocenter") or {}
     origin = parse_jst(str(eq.get("originTime", "")), "%Y/%m/%d %H:%M:%S")
-    if origin is None:
-        return None
-
     issue = data.get("issue") or {}
+    if origin is None:
+        # 取消報は震源要素を持たないことがある。JMA の EEW 識別番号 (issue.eventId)
+        # を event_id にすれば、wolfx/kmoni 発のイベントには直接一致する
+        if data.get("cancelled") and issue.get("eventId"):
+            return EEWEvent(
+                source=SOURCE,
+                event_id=str(issue["eventId"]),
+                serial=int(issue.get("serial") or 0),
+                announced_time=parse_jst(str(issue.get("time", "")),
+                                         "%Y/%m/%d %H:%M:%S"),
+                is_warn=True,
+                is_cancel=True,
+            )
+        return None
     try:
         serial = int(issue.get("serial") or 0)
     except (ValueError, TypeError):
@@ -44,18 +56,21 @@ def _parse_556(data: dict) -> EEWEvent | None:
     def _num(v):
         try:
             f = float(v)
-            return f if f > -200 else None  # P2P は欠測を -1 等で返すことがある
+            return f if f > -200 else None  # 座標の欠測センチネルは -200
         except (ValueError, TypeError):
             return None
 
     depth = _num(hypo.get("depth"))
+    mag = _num(hypo.get("magnitude"))
+    if mag is not None and mag <= 0:  # M の欠測は -1 で届く
+        mag = None
     return EEWEvent(
         source=SOURCE,
         # Wolfx / kmoni の EEW イベントID (発生時刻 yyyyMMddHHmmss) に揃える
         event_id=origin.strftime("%Y%m%d%H%M%S"),
         serial=serial,
         hypocenter=str(hypo.get("name") or ""),
-        magnitude=_num(hypo.get("magnitude")),
+        magnitude=mag,
         depth_km=int(depth) if depth is not None and depth >= 0 else None,
         max_intensity="",  # 556 は最大震度そのものは持たない (警報地域のみ)
         latitude=_num(hypo.get("latitude")),
@@ -65,6 +80,8 @@ def _parse_556(data: dict) -> EEWEvent | None:
         is_warn=True,  # 556 は警報のみ
         is_cancel=bool(data.get("cancelled")),
         is_training=bool(data.get("test")),
+        # PLUM法等の仮定震源。M はダミー値 (1.0) なので距離減衰式に使ってはいけない
+        is_assumption=str(eq.get("condition") or "") == "仮定震源要素",
         warn_areas=areas,
     )
 
@@ -97,7 +114,12 @@ class P2PSource:
         mag = hypo.get("magnitude")
         mag_s = f" M{mag:.1f}" if isinstance(mag, (int, float)) and mag >= 0 else ""
         depth = hypo.get("depth")
-        depth_s = f" 深さ{int(depth)}km" if isinstance(depth, (int, float)) and depth >= 0 else ""
+        if isinstance(depth, (int, float)) and depth == 0:
+            depth_s = " ごく浅い"       # P2P 仕様: depth 0 は「ごく浅い」の意味
+        elif isinstance(depth, (int, float)) and depth > 0:
+            depth_s = f" 深さ{int(depth)}km"
+        else:
+            depth_s = ""
         tsunami = eq.get("domesticTsunami")
         tsunami_s = {"None": "津波の心配なし", "Unknown": "津波不明",
                      "Checking": "津波調査中", "NonEffective": "若干の海面変動",

@@ -57,6 +57,7 @@ def _parse(data: dict) -> EEWEvent | None:
         is_final=bool(data.get("isFinal")),
         is_cancel=bool(data.get("isCancel")),
         is_training=bool(data.get("isTraining")),
+        is_assumption=bool(data.get("isAssumption")),  # PLUM法の仮定震源 (Mはダミー)
         warn_areas=warn_areas,
     )
 

@@ -14,6 +14,7 @@ _INTENSITY_RANK = {
     "6-": 7, "6弱": 7,
     "6+": 8, "6強": 8,
     "7": 9,
+    "5弱以上": 5,  # 震度計欠測時の「震度5弱以上と推定」(P2P scale 46)
 }
 
 # 順序値 -> 表示用震度文字列
@@ -22,7 +23,7 @@ _RANK_LABEL = ["0", "1", "2", "3", "4", "5弱", "5強", "6弱", "6強", "7"]
 # P2P地震情報の scale 値 -> 順序値
 _P2P_SCALE_RANK = {
     10: 1, 20: 2, 30: 3, 40: 4,
-    45: 5, 50: 6, 55: 7, 60: 8, 70: 9,
+    45: 5, 46: 5, 50: 6, 55: 7, 60: 8, 70: 9,
 }
 
 
@@ -42,6 +43,8 @@ def rank_label(rank: int) -> str:
 def p2p_scale_label(scale: int | None) -> str:
     if scale is None:
         return "不明"
+    if scale == 46:  # 詳細未入電の大地震で使われる推定値
+        return "5弱以上"
     return rank_label(_P2P_SCALE_RANK.get(scale, -1))
 
 
@@ -88,6 +91,7 @@ class EEWEvent:
     is_final: bool = False
     is_cancel: bool = False
     is_training: bool = False
+    is_assumption: bool = False     # 仮定震源要素 (PLUM法)。M・震源は当てにならない
     warn_areas: list[str] = field(default_factory=list)
     received_at: datetime = field(default_factory=now_jst)
 

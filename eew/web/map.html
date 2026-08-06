@@ -8,6 +8,8 @@
 <style>
   html, body { margin: 0; height: 100%; background: #111; font-family: "Yu Gothic UI", "Meiryo", sans-serif; }
   #map { position: absolute; inset: 0; background: #0b0e14; }  /* 海 */
+  /* 自前UIのみ border-box (Leaflet 内部には触れない) */
+  #panel, #panel *, #legend, #legend *, #clock, #clock *, #tsunami-banner { box-sizing: border-box; }
   /* 情報パネル */
   #panel {
     position: absolute; top: 12px; left: 12px; z-index: 1000;
@@ -37,7 +39,7 @@
   #home-int { font-size: 12px; color: #8a8f98; margin-top: 6px; }
   #areas { display: none; }
   #gm-note { font-size: 13px; color: #ffd60a; margin-top: 6px; display: none; }
-  .note { font-size: 11px; color: #6b7078; margin-top: 8px; }
+  .note { font-size: 12px; color: #8a8f98; margin-top: 8px; }  /* AA 4.5:1 以上 */
   .epi-icon { color: #ff3b30; font-size: 30px; font-weight: bold; text-shadow: 0 0 6px #000;
               line-height: 30px; text-align: center; }
   .gm-icon { width: 18px; height: 18px; border-radius: 50%; background: rgba(255,204,0,.85);
@@ -55,6 +57,12 @@
   #tsunami-banner { cursor: pointer; }
   #tsunami-banner .head { font-size: 22px; }
   #tsunami-banner .areas { font-size: 13px; font-weight: normal; margin-top: 4px; }
+  /* 津波バナー表示中はパネル・時計を下げて重なりを防ぐ (警報文を隠さない) */
+  body.has-tsunami #panel, body.has-tsunami #clock { top: 100px; }
+  @media (max-width: 1100px) {
+    #tsunami-banner { left: 0; right: 0; transform: none;
+                      max-width: none; min-width: 0; border-radius: 0; }
+  }
   /* 現在時刻 (日本標準時) */
   #clock {
     position: absolute; top: 12px; right: 12px; z-index: 1000;
@@ -69,7 +77,8 @@
               margin-right: 10px; vertical-align: middle; background: #ff453a; }
   #conn-dot.ok { background: #34c759; }
   #clock-date { font-size: 12px; color: #8a8f98; }
-  #clock-src  { font-size: 10px; color: #6b7078; }
+  #clock-src  { font-size: 11px; color: #8a8f98; }
+  #clock-src.err { color: #ff453a; font-weight: bold; }
   /* 観測震度の凡例 */
   #legend {
     position: absolute; bottom: 24px; left: 12px; z-index: 1000;
@@ -78,10 +87,21 @@
     font-size: 16px; font-weight: bold;
     box-shadow: 0 4px 16px rgba(0,0,0,.5);
   }
-  #legend .row { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+  #legend .row { display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
   #legend .chip { width: 52px; height: 34px; border-radius: 6px; text-align: center;
                   line-height: 34px; font-weight: bold; font-size: 17px; }
   #legend .chip.wide { width: auto; padding: 0 12px; }
+  #legend .symbols { font-size: 12px; font-weight: normal; color: #b8bcc4; margin-top: 8px; }
+  /* スマホ幅: 全要素をビューポート内に収める (時計の下にパネルを積む) */
+  @media (max-width: 600px) {
+    #clock { padding: 6px 10px; }
+    #clock-time { font-size: 20px; }
+    #panel { top: 68px; left: 8px; right: 8px; min-width: 0; max-width: none; }
+    #legend { left: 8px; max-width: calc(100% - 16px); padding: 10px 12px; font-size: 14px; }
+    #legend .chip { width: 38px; height: 28px; line-height: 28px; font-size: 13px; }
+    body.has-tsunami #clock { top: 110px; }
+    body.has-tsunami #panel { top: 166px; }
+  }
 </style>
 </head>
 <body>
@@ -116,7 +136,8 @@
   <div id="areas"></div>
   <div id="gm-note"></div>
   <div class="note">地図を右クリック(長押し)で自宅位置を設定できます。<br>
-    予想震度・到達時刻は暫定値 (±数秒の目安)。防災行動は気象庁の公式情報に従ってください。</div>
+    予想震度は安全側 (やや大きめ) に出る傾向があります。到達時刻は±数秒の目安。<br>
+    防災行動は気象庁の公式情報に従ってください。</div>
 </div>
 <script src="ws_port.js"></script>
 <script src="vendor/leaflet.js"></script>
@@ -153,6 +174,8 @@ L.Icon.Default.prototype.options.imagePath = "vendor/images/";
 
 // P/S波円は Canvas レンダラーで毎フレーム更新しても滑らかに描く
 const waveRenderer = L.canvas({ padding: 1.0 });
+// 観測震度は別キャンバスに分離 (円アニメーションのたびに全点再描画させない)
+const gridRenderer = L.canvas({ padding: 0.5 });
 
 // ---- 観測震度の配色 (ユーザー指定) ----
 // [しきい値(リアルタイム震度), 塗り色, 文字色, ラベル]
@@ -184,6 +207,8 @@ function renderLegend(mode) {
     chip.textContent = label;
     row.appendChild(chip);
   };
+  const old = document.getElementById("legend-symbols");
+  if (old) old.remove();
   if (mode === "tsunami") {
     title.textContent = "津波予報";
     add("#F6D500", "#111", "津波注意報", true);
@@ -193,17 +218,27 @@ function renderLegend(mode) {
     title.textContent = "観測震度 (強震モニタ)";
     [...INT_SCALE].reverse().forEach(([, color, text, label]) =>
       add(color, text, label, false));
+    // 地図上の記号は凡例で必ず説明する (初見者が3秒で読めるように)
+    const sym = document.createElement("div");
+    sym.className = "symbols";
+    sym.id = "legend-symbols";
+    sym.textContent = "✕ 震央 / 青破線 P波 / 赤円 S波(強い揺れの範囲)";
+    row.parentElement.appendChild(sym);
   }
 }
 renderLegend("intensity");
 const intensityLayer = L.layerGroup().addTo(map);
+let pendingGrid = null;   // 津波モード中に受けた最新フレーム (復帰時に描く)
 function onIntensityGrid(msg) {
+  if (tsunamiMode) { pendingGrid = msg; return; }  // 非表示レイヤーへの毎秒生成を避ける
   intensityLayer.clearLayers();
-  for (const [lat, lon, v] of msg.points || []) {
+  // 弱い震度から描き、強い揺れの点が必ず上に来るようにする
+  const pts = [...(msg.points || [])].sort((a, b) => a[2] - b[2]);
+  for (const [lat, lon, v] of pts) {
     const color = intColor(v);
     if (!color) continue;
     L.circleMarker([lat, lon], {
-      renderer: waveRenderer, radius: 5,
+      renderer: gridRenderer, radius: v >= 4.5 ? 7 : 5,  // 震度5弱以上は大きく
       color: "#222", weight: 1, fillColor: color, fillOpacity: 0.9,
     }).addTo(intensityLayer);
   }
@@ -286,9 +321,12 @@ map.on("contextmenu", e => {
 });
 
 function setStatus(ok) {
-  // 時計左のランプ: 緑=受信中, 赤=切断
+  // ランプの色だけに頼らず文字でも状態を出す (色覚多様性・小ささ対策)
   $("conn-dot").classList.toggle("ok", !!ok);
   disconnectedAt = ok ? null : (disconnectedAt || Date.now());
+  const src = $("clock-src");
+  src.textContent = ok ? "日本標準時 (NICT同期)" : "切断 - 再接続中...";
+  src.classList.toggle("err", !ok);
 }
 
 function dropEvent(id) {
@@ -374,7 +412,9 @@ function renderPanel() {
   const id = selectEvent();
   if (!id) {
     $("title").textContent = "待機中";
-    $("detail").textContent = "緊急地震速報を受信するとここに表示されます。";
+    $("detail").textContent = disconnectedAt
+      ? "サーバとの接続が切れています。再接続を試行中..."
+      : "緊急地震速報を受信するとここに表示されます。";
     $("verdict").style.display = "none";
     $("countdown-box").style.display = "none";
     $("countdown").textContent = "--";
@@ -390,8 +430,12 @@ function renderPanel() {
   // 詳細は1行に圧縮 (緊急時に読むものではない)
   const parts = [];
   if (msg.hypocenter) parts.push(msg.hypocenter);
-  if (msg.magnitude != null) parts.push(`M${msg.magnitude.toFixed(1)}`);
-  if (msg.depth_km != null) parts.push(`深さ${msg.depth_km}km`);
+  if (msg.is_assumption) {
+    parts.push("震源仮定(PLUM)");  // M・深さはダミー値なので出さない
+  } else {
+    if (msg.magnitude != null) parts.push(`M${msg.magnitude.toFixed(1)}`);
+    if (msg.depth_km != null) parts.push(`深さ${msg.depth_km}km`);
+  }
   if (msg.max_intensity) parts.push(`最大震度${msg.max_intensity}`);
   $("detail").textContent = parts.join(" / ");
 
@@ -414,6 +458,11 @@ function renderPanel() {
     $("home-int-big").textContent = msg.home.intensity_label;
     $("home-int").textContent =
       `${msg.hypocenter || ""} / 震央距離${msg.home.epicentral_km}km / 暫定値・±数秒の目安`;
+  } else {
+    // 選択イベントの切替時に、別の地震の予想震度を残留させない
+    $("home-int-big").textContent = "-";
+    $("home-int").textContent = "";
+    if (!events.get(id).serverRemaining) $("countdown-box").style.display = "none";
   }
 }
 
@@ -484,7 +533,9 @@ function autoFit(force = false) {
   if (force || !map.getBounds().contains(target)) {
     autoFitting = true;
     map.fitBounds(target);
-    setTimeout(() => { autoFitting = false; }, 600);
+    // アニメーション完了で解除 (固定600msだとアニメ中のユーザー操作を取りこぼす)
+    map.once("moveend", () => { autoFitting = false; });
+    setTimeout(() => { autoFitting = false; }, 2000);  // moveend が来ない場合の保険
   }
 }
 setInterval(autoFit, 2000);
@@ -496,6 +547,12 @@ function tick() {
     lastTsunami = null;
     if (tsunamiMode) exitTsunamiMode();
     $("tsunami-banner").style.display = "none";
+    document.body.classList.remove("has-tsunami");
+    // 観測震度・揺れ検知も「現在の状態」ではないので消す
+    intensityLayer.clearLayers();
+    pendingGrid = null;
+    if (gmMarker) { map.removeLayer(gmMarker); gmMarker = null; }
+    $("gm-note").style.display = "none";
     if (events.size > 0) {
       for (const id of [...events.keys()]) dropEvent(id);
       renderPanel();
@@ -612,6 +669,7 @@ function exitTsunamiMode() {
   tsunamiMode = false;
   if (tsunamiLayer) { map.removeLayer(tsunamiLayer); tsunamiLayer = null; }
   intensityLayer.addTo(map);
+  if (pendingGrid) { const g = pendingGrid; pendingGrid = null; onIntensityGrid(g); }
   setEventLayersVisible(true);
   renderLegend("intensity");         // 凡例を観測震度に戻す
   autoFit(true);
@@ -629,6 +687,7 @@ function onTsunami(msg) {
     lastTsunami = null;
     if (tsunamiMode) exitTsunamiMode();
     b.style.display = "none";
+    document.body.classList.remove("has-tsunami");
     return;
   }
   lastTsunami = msg;
@@ -643,10 +702,11 @@ function onTsunami(msg) {
 function renderTsunamiBanner() {
   const msg = lastTsunami;
   const b = $("tsunami-banner");
+  document.body.classList.toggle("has-tsunami", !!msg);  // パネル・時計を下げる
   if (!msg) { b.style.display = "none"; return; }
   const hint = tsunamiMode
-    ? '<div style="font-size:11px;opacity:.8;margin-top:3px">クリックで通常表示に戻る</div>'
-    : '<div style="font-size:11px;opacity:.8;margin-top:3px">クリックで津波地図を表示</div>';
+    ? '<div style="font-size:12px;margin-top:3px">クリックで通常表示に戻る</div>'
+    : '<div style="font-size:12px;margin-top:3px">クリックで津波地図を表示</div>';
   if (msg.home_grade) {
     // 自分の地域が対象: 最大級の表示 + 行動指示のみ (段階で文言を変える)
     const st = TSUNAMI_STYLE[msg.home_grade] || TSUNAMI_STYLE["津波警報"];

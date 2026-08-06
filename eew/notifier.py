@@ -54,24 +54,54 @@ def configure(cfg: dict) -> None:
         display.log_system(f"カスタム音源: {names}", display.GREEN)
 
 
-def _play_file(path: Path) -> None:
-    """WAV/MP3 を Windows MCI で非同期再生する。"""
+def _mci(cmd: str) -> tuple[int, str]:
+    """mciSendStringW 1 回。(エラーコード, 応答文字列) を返す。0 = 成功。"""
+    buf = ctypes.create_unicode_buffer(256)
+    err = ctypes.windll.winmm.mciSendStringW(cmd, buf, 255, None)
+    return err, buf.value
+
+
+def _mci_error_text(err: int) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    ctypes.windll.winmm.mciGetErrorStringW(err, buf, 255)
+    return buf.value or f"MCIエラー {err}"
+
+
+def _play_file(path: Path) -> bool:
+    """WAV/MP3 を Windows MCI で再生する。開始できたら True。
+
+    失敗 (コーデック非対応・ファイル破損等) は呼び出し側でビープに退避させる。
+    """
     global _mci_counter
+    with _mci_lock:
+        _mci_counter += 1
+        alias = f"eewsnd{_mci_counter}"
     try:
-        with _mci_lock:
-            _mci_counter += 1
-            alias = f"eewsnd{_mci_counter}"
-        mci = ctypes.windll.winmm.mciSendStringW
-        # 前々回分の後始末は close で自動 (エラーは無視)
-        mci(f'open "{path}" alias {alias}', None, 0, None)
-        mci(f"play {alias} from 0", None, 0, None)
-        # 再生終了後に閉じる (最長60秒で強制クローズ)
-        def _closer():
-            mci(f"close {alias}", None, 0, None)
-        threading.Timer(60, _closer).start()
+        err, _ = _mci(f'open "{path}" alias {alias}')
+        if err:
+            display.log_system(
+                f"音源再生失敗 ({_mci_error_text(err)}): {path.name}、内蔵ビープで代替",
+                display.YELLOW)
+            return False
+        # 実際の音源長 (ms) に合わせて閉じる。取得できなければ60秒で保険クローズ
+        _, length = _mci(f"status {alias} length")
+        try:
+            close_after = int(length) / 1000 + 5
+        except (ValueError, TypeError):
+            close_after = 60
+        err, _ = _mci(f"play {alias} from 0")
+        if err:
+            display.log_system(
+                f"音源再生失敗 ({_mci_error_text(err)}): {path.name}、内蔵ビープで代替",
+                display.YELLOW)
+            _mci(f"close {alias}")
+            return False
+        threading.Timer(close_after, lambda: _mci(f"close {alias}")).start()
+        return True
     except Exception as e:
         display.log_system(f"音源再生失敗 ({type(e).__name__}): {path.name}",
                            display.YELLOW)
+        return False
 
 
 def _beep_pattern(pattern: list[tuple[int, int]], repeat: int) -> None:
@@ -85,29 +115,40 @@ def _beep_pattern(pattern: list[tuple[int, int]], repeat: int) -> None:
                 return
 
 
+_PATTERNS = {
+    # 警報: 高音を強く繰り返す
+    "warning": ([(880, 180), (1175, 180), (880, 180), (1175, 180)], 3),
+    # 予報: 2 音 × 2
+    "forecast": ([(660, 150), (880, 200)], 2),
+    # 津波警報: 低音の長い繰り返し
+    "tsunami": ([(523, 400), (392, 400)], 3),
+    # 津波注意報: 中程度のチャイム (info より明確に強く、警報よりは控えめ)
+    "tsunami_watch": ([(523, 300), (659, 300)], 2),
+    # 確定情報など: 短い 1 音
+    "info": ([(740, 180)], 1),
+}
+
+
+def _beep_for(kind: str) -> None:
+    pattern, repeat = _PATTERNS.get(kind, _PATTERNS["info"])
+    _beep_pattern(pattern, repeat)
+
+
 def play_sound(kind: str, enabled: bool = True) -> None:
-    """kind: 'warning' | 'forecast' | 'info' | 'tsunami'"""
+    """kind: 'warning' | 'forecast' | 'info' | 'tsunami' | 'tsunami_watch'"""
     if not enabled:
         return
-    # カスタム音源があればそれを再生 (WAV/MP3)
+    # カスタム音源があればそれを再生 (WAV/MP3)。MCI 失敗時は内蔵ビープに退避
     custom = _sound_files.get(kind)
     if custom is not None:
-        threading.Thread(target=_play_file, args=(custom,), daemon=True).start()
+        def _run():
+            if not _play_file(custom):
+                _beep_for(kind)
+        threading.Thread(target=_run, daemon=True).start()
         return
     if winsound is None:
         return
-    patterns = {
-        # 警報: 高音を強く繰り返す
-        "warning": ([(880, 180), (1175, 180), (880, 180), (1175, 180)], 3),
-        # 予報: 2 音 × 2
-        "forecast": ([(660, 150), (880, 200)], 2),
-        # 津波: 低音の長い繰り返し
-        "tsunami": ([(523, 400), (392, 400)], 3),
-        # 確定情報など: 短い 1 音
-        "info": ([(740, 180)], 1),
-    }
-    pattern, repeat = patterns.get(kind, patterns["info"])
-    threading.Thread(target=_beep_pattern, args=(pattern, repeat), daemon=True).start()
+    threading.Thread(target=_beep_for, args=(kind,), daemon=True).start()
 
 
 def _do_toast(title: str, message: str, urgent: bool) -> None:
@@ -134,10 +175,12 @@ def toast(title: str, message: str, urgent: bool = False, enabled: bool = True) 
     threading.Thread(target=_do_toast, args=(title, message, urgent), daemon=True).start()
 
 
-def notify_eew(ev: EEWEvent, cfg: dict, reason: str, home_est=None) -> None:
+def notify_eew(ev: EEWEvent, cfg: dict, reason: str, home_est=None,
+               in_warn_area: bool | None = None) -> None:
     """EEW をトースト+音で通知する。reason: 'new' | 'upgrade' | 'final' | 'cancel'
 
     home_est: estimate.HomeEstimate (あれば自宅予想震度・到達秒数を本文に含める)
+    in_warn_area: 自宅都道府県が警報対象地域か (不明は None)
     """
     ncfg = cfg.get("notify", {})
     sound_on = ncfg.get("sound_enabled", True)
@@ -146,24 +189,29 @@ def notify_eew(ev: EEWEvent, cfg: dict, reason: str, home_est=None) -> None:
     kind = "警報" if ev.is_warn else "予報"
 
     if reason == "cancel":
-        toast(f"緊急地震速報({kind}) 取消", f"{ev.hypocenter} の速報は取り消されました",
+        toast(f"【取消】緊急地震速報({kind})", f"{ev.hypocenter} の速報は取り消されました",
               urgent=False, enabled=toast_on)
         play_sound("info", sound_on)
         return
 
+    # 自分事 (この場所がどうなるか) を先頭に置く。トーストは約2行で切り詰められるため、
+    # 末尾の震源情報が消えても行動判断に必要な情報が残る並びにする
     body_parts = []
-    if ev.hypocenter:
-        body_parts.append(f"震源: {ev.hypocenter}")
-    if ev.magnitude is not None:
-        body_parts.append(f"M{ev.magnitude:.1f}")
-    if ev.max_intensity:
-        body_parts.append(f"最大震度 {ev.max_intensity}")
+    if in_warn_area:
+        body_parts.append("この地域は警報対象です")
     if home_est is not None:
         body_parts.append(f"自宅予想震度 {home_est.intensity_label}(暫定)")
         remaining = home_est.s_remaining(now_jst())
         if remaining is not None and remaining > 0:
             body_parts.append(f"S波まで約{int(remaining)}秒")
-    body_parts.append(f"第{ev.serial}報" + ("(最終)" if ev.is_final else ""))
+    if ev.hypocenter:
+        body_parts.append(f"震源: {ev.hypocenter}")
+    if ev.is_assumption:
+        body_parts.append("震源仮定(PLUM)")  # M はダミー値なので出さない
+    elif ev.magnitude is not None:
+        body_parts.append(f"M{ev.magnitude:.1f}")
+    if ev.max_intensity:
+        body_parts.append(f"最大震度 {ev.max_intensity}")
     body = " / ".join(body_parts)
 
     title_prefix = {"new": "", "upgrade": "【更新】", "final": "【最終報】"}.get(reason, "")

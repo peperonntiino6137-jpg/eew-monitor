@@ -103,11 +103,17 @@ class MapServer:
         threading.Thread(target=self._httpd.serve_forever,
                          name="map-http", daemon=True).start()
 
-        self._ws_server = await websockets.serve(
-            self._ws_handler, "127.0.0.1", self.ws_port,
-            # ブラウザからは自ページのみ許可。Origin ヘッダなし (CLIクライアント等) は許可
-            origins=[f"http://127.0.0.1:{self.http_port}",
-                     f"http://localhost:{self.http_port}", None])
+        try:
+            self._ws_server = await websockets.serve(
+                self._ws_handler, "127.0.0.1", self.ws_port,
+                # ブラウザからは自ページのみ許可。Origin ヘッダなし (CLI等) は許可
+                origins=[f"http://127.0.0.1:{self.http_port}",
+                         f"http://localhost:{self.http_port}", None])
+        except OSError as e:
+            # headless 時に生のトレースバックで黙って落ちないよう明示エラーにする
+            self._httpd.shutdown()
+            raise AlreadyRunningError(
+                f"WSポート {self.ws_port} が使用中 (既に起動していませんか?)") from e
         display.log_system(f"地図サーバ起動: {self.url}", display.GREEN)
 
         # 地図の時計用に日本標準時 (NICT補正済み) を定期配信
@@ -131,10 +137,13 @@ class MapServer:
                 {**self._init_payload, "server_now": now_jst().isoformat()},
                 ensure_ascii=False))
             # 進行中の全 EEW を再送 (鮮度内のみ。古い速報を「現在」と誤認させない)
+            # server_now は発行時点の値のままだとクライアント時計を巻き戻すため現在時刻に差し替える
             now = time.monotonic()
             for payload, ts in sorted(self._active_eew.values(), key=lambda x: x[1]):
                 if now - ts < REPLAY_MAX_AGE_SEC:
-                    await ws.send(json.dumps(payload, ensure_ascii=False))
+                    await ws.send(json.dumps(
+                        {**payload, "server_now": now_jst().isoformat()},
+                        ensure_ascii=False))
             # 発表中の津波予報も再送 (津波で開いたタブにバナーを出すため)
             if (self._last_tsunami is not None
                     and time.monotonic() - self._last_tsunami_at
@@ -219,6 +228,8 @@ class MapServer:
         """ブラウザで地図を開く。接続中クライアントがいればタブ増殖させない。"""
         if not force and self._clients:
             return
+        # 起動〜WS接続完了前に警報が来ても maybe_open_on_warning が二重に開かないようにする
+        self._last_open_at = time.monotonic()
         threading.Thread(target=self._do_open, daemon=True).start()
 
     def _do_open(self) -> None:

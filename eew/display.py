@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-from .models import EEWEvent, now_jst
+from .models import EEWEvent, intensity_rank, now_jst
 
 # Windows コンソールで ANSI エスケープを有効化
 # (pythonw ではコンソールが無く os.system が一瞬ウィンドウを生むためスキップ)
@@ -89,12 +89,23 @@ def show_eew(ev: EEWEvent, is_new: bool) -> None:
     parts.append(f"第{ev.serial}報" + ("(最終)" if ev.is_final else ""))
     if ev.hypocenter:
         parts.append(f"震源:{ev.hypocenter}")
-    if ev.magnitude is not None:
-        parts.append(f"M{ev.magnitude:.1f}")
-    if ev.depth_km is not None:
-        parts.append(f"深さ{ev.depth_km}km")
+    if ev.is_assumption:
+        parts.append("震源仮定(PLUM)")  # M・深さはダミー値なので出さない
+    else:
+        if ev.magnitude is not None:
+            parts.append(f"M{ev.magnitude:.1f}")
+        if ev.depth_km is not None:
+            parts.append(f"深さ{ev.depth_km}km")
     if ev.max_intensity:
-        parts.append(f"{BOLD}最大震度 {ev.max_intensity}{RESET}")
+        # 重大な報を流れるログから一目で拾えるよう震度で色を変える
+        rank = intensity_rank(ev.max_intensity)
+        if rank >= 5:
+            int_col = WHITE_ON_RED
+        elif rank >= 3:
+            int_col = BOLD + YELLOW
+        else:
+            int_col = BOLD
+        parts.append(f"{int_col}最大震度 {ev.max_intensity}{RESET}")
 
     lat = ev.latency_ms()
     if lat is not None:
@@ -116,5 +127,6 @@ def banner() -> None:
 ╚══════════════════════════════════════════════════╝{RESET}
   Ctrl+C で終了
 """)
-    if _logger is None and not sys.stdout.isatty():
+    # pythonw では sys.stdout が None (--headless 付け忘れでも落とさない)
+    if _logger is None and sys.stdout is not None and not sys.stdout.isatty():
         log_system("非TTY出力: カラー表示が崩れる場合があります")

@@ -104,8 +104,13 @@ async def amain(headless: bool = False) -> None:
                 home["name"] = "自宅"
             save_config(cfg)
             agg.set_home(lat, lon)
+            # 都道府県も再計算する (警報対象・津波予報区の自分事判定に使われる)
+            pref = region.nearest_pref(lat, lon)
+            home["_pref"] = pref
+            agg.home_pref = pref
             display.log_system(
-                f"自宅地点を地図から更新: ({lat:.4f}, {lon:.4f}) [確定]", display.GREEN)
+                f"自宅地点を地図から更新: ({lat:.4f}, {lon:.4f}) {pref} [確定]",
+                display.GREEN)
         mapsrv.on_set_home = on_set_home
 
     async def supervised(name: str, factory) -> None:
@@ -123,6 +128,13 @@ async def amain(headless: bool = False) -> None:
             await asyncio.sleep(10)
 
     src_cfg = cfg.get("sources", {})
+    # timesync は常に動くため、受信ソースの有無はここで判定する
+    if not (src_cfg.get("wolfx", True) or src_cfg.get("kmoni", True)
+            or src_cfg.get("p2p", True)
+            or cfg.get("kmoni_image", {}).get("enabled", True)):
+        display.log_system("有効なソースがありません (config.json を確認)", display.RED)
+        return
+
     tasks: list[asyncio.Task] = []
     kmoni_client = None
 
@@ -154,10 +166,6 @@ async def amain(headless: bool = False) -> None:
                 agg.handle_eew, cfg,
                 mapsrv.broadcast if mapsrv else None).run()),
             name="p2p"))
-
-    if not tasks:
-        display.log_system("有効なソースがありません (config.json を確認)", display.RED)
-        return
 
     display.log_system(f"受信開始: {', '.join(t.get_name() for t in tasks)}")
     try:

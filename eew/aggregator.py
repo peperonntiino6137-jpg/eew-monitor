@@ -95,6 +95,8 @@ class Aggregator:
             return self._aliases[ev.event_id]
         if ev.origin_time is not None:
             for key, st in self.events.items():
+                if st.cancelled:
+                    continue  # 取消済みへ統合すると再発表が握り潰される
                 le = st.latest
                 if le is None or le.origin_time is None:
                     continue
@@ -144,6 +146,7 @@ class Aggregator:
             "is_warn": ev.is_warn,
             "is_final": ev.is_final,
             "is_cancel": ev.is_cancel or st.cancelled,
+            "is_assumption": ev.is_assumption,
             "warn_areas": ev.warn_areas,
             "home": None,
         }
@@ -205,8 +208,15 @@ class Aggregator:
             })
 
             if remaining <= -15:
-                display.log_system(f"[{self.home_name}] カウントダウン終了", display.DIM)
+                if est.intensity_rank >= 1:
+                    display.log_system(f"[{self.home_name}] カウントダウン終了",
+                                       display.DIM)
                 return
+
+            # 予想震度0 (揺れを感じない) はコンソールに流さない。
+            # 連発時のノイズ対策で、地図へのプッシュは上で継続している
+            if est.intensity_rank < 1:
+                continue
 
             # コンソール表示の間引き: >30s は10秒毎 / >5s は5秒毎 / それ以下は毎秒
             r = int(remaining)
@@ -261,14 +271,22 @@ class Aggregator:
                 self._publish_eew(ev, st)
             return
 
+        # 取消済みイベントへの遅延続報 (順序逆転した final 等) は無視する
+        if st.cancelled:
+            display.log(ev.source, f"取消済みイベントの続報を無視: 第{ev.serial}報",
+                        display.DIM)
+            return
+
         # ---- 重複判定: 既に見た報数以下なら別ソースの遅れ着信 ----
         if not is_new and ev.serial <= st.max_serial:
             became_warn = ev.is_warn and not st.warned
             rank_up = ev.intensity_rank > st.max_intensity_rank
             if not became_warn and not rank_up:
                 return  # 完全な重複。表示もしない
+        # 古い報 (別ソースの遅れ着信) で最新状態を巻き戻さない
+        if ev.serial >= st.max_serial:
+            st.latest = ev
         st.max_serial = max(st.max_serial, ev.serial)
-        st.latest = ev
 
         # ---- 自宅地点の推定 (毎報再計算して補正) ----
         home_est = None
@@ -279,8 +297,11 @@ class Aggregator:
 
         # ---- 表示 ----
         display.show_eew(ev, is_new=is_new)
+        in_warn_area = None
         if ev.is_warn and self.home_pref and ev.warn_areas:
-            if any(region.matches_area(self.home_pref, a) for a in ev.warn_areas):
+            in_warn_area = any(region.matches_area(self.home_pref, a)
+                               for a in ev.warn_areas)
+            if in_warn_area:
                 display.log_system(
                     f"{display.WHITE_ON_RED}【{self.home_pref}は警報対象地域です】"
                     f"{display.RESET}")
@@ -307,8 +328,8 @@ class Aggregator:
             reason = "new"
         elif ev.is_warn and not st.warned:
             reason = "upgrade"      # 予報 -> 警報 格上げ
-        elif ev.intensity_rank > st.max_intensity_rank >= 0 and ev.intensity_rank >= 5:
-            reason = "upgrade"      # 震度5弱以上への上方修正
+        elif ev.intensity_rank >= 5 and ev.intensity_rank > st.max_intensity_rank:
+            reason = "upgrade"      # 震度5弱以上への上方修正 (震度不明からの確定を含む)
         elif ev.is_final and not st.finalized:
             reason = "final"
 
@@ -321,14 +342,16 @@ class Aggregator:
 
         # 予報の通知フィルタ (警報は常に通知する)
         if not ev.is_warn and reason in ("new", "final"):
-            if self.use_home_intensity and home_est is not None:
+            # この報で推定できなくても直近の有効推定 (st.estimate) で判定を継続する
+            est_filter = home_est or st.estimate
+            if self.use_home_intensity and est_filter is not None:
                 # 自宅予想震度ベース: 遠方の地震で鳴らさない
-                if home_est.intensity_rank < self.forecast_min_rank:
+                if est_filter.intensity_rank < self.forecast_min_rank:
                     return
             elif ev.intensity_rank < self.forecast_min_rank:
                 return
 
-        notifier.notify_eew(ev, self.cfg, reason, home_est)
+        notifier.notify_eew(ev, self.cfg, reason, home_est, in_warn_area)
 
     # --------------------------------------------------------- ground motion
 

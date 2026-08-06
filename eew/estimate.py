@@ -99,6 +99,9 @@ def estimate_home(ev: EEWEvent, home_lat: float, home_lon: float,
     """EEW 1 報から自宅地点の揺れを推定。震源情報が不足なら None。"""
     if ev.latitude is None or ev.longitude is None or ev.magnitude is None:
         return None
+    if ev.is_assumption or ev.magnitude <= 0:
+        # 仮定震源 (PLUM) の M はダミー値。距離減衰式に入れると震度0が出てしまう
+        return None
     depth = float(ev.depth_km if ev.depth_km is not None else 10.0)
 
     epi = haversine_km(home_lat, home_lon, ev.latitude, ev.longitude)

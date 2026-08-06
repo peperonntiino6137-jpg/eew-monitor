@@ -27,7 +27,8 @@ async def _locate_windows() -> tuple[float, float, float] | None:
     except ImportError:
         return None
     try:
-        status = await Geolocator.request_access_async()
+        # ここは起動処理をブロックするため、応答が無い場合もタイムアウトで先へ進む
+        status = await asyncio.wait_for(Geolocator.request_access_async(), timeout=10)
         if status != GeolocationAccessStatus.ALLOWED:
             display.log_system(
                 "Windows位置情報が許可されていません "
