@@ -8,16 +8,21 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable
 
-from . import display, notifier, region
+from . import display, eventlog, notifier, recorder, region
 from .estimate import HomeEstimate, estimate_home, haversine_km
-from .models import EEWEvent, GroundMotionEvent, intensity_rank, now_jst
+from .models import (EEWEvent, GroundMotionEvent, intensity_rank, now_jst,
+                     rank_label)
 
 # ソース間でイベントIDが数秒ズレるときの同一イベント判定 (P2P は originTime 由来のため)
 MERGE_TIME_SEC = 12.0
 MERGE_DIST_KM = 150.0
 PRUNE_AFTER_SEC = 1800  # 終息した古いイベントの保持期限
+RANK_INT3 = intensity_rank("3")  # 専用音 (全国/自宅の震度3以上) のしきい値
+INFO_MATCH_SEC = 90.0        # 確定情報と EEW イベントの同一判定 (発生時刻差)
+INFO_RECORD_SEC = 45.0       # EEW を伴わない確定情報の収録時間 (静的表示のため短め)
 
 
 @dataclass
@@ -27,11 +32,14 @@ class _EventState:
     warned: bool = False           # 警報として通知済みか
     finalized: bool = False
     cancelled: bool = False
+    sounded_home3: bool = False      # 「震度3以上到達予定」音を鳴らした
+    sounded_national3: bool = False  # 「全国震度3以上」音を鳴らした
     first_source: str = ""
     sources: set[str] = field(default_factory=set)
     latest: EEWEvent | None = None
     estimate: HomeEstimate | None = None
     last_update: object = None     # datetime
+    recording: recorder.Recording | None = None  # 地図画面の収録 (震度3以上)
 
 
 class Aggregator:
@@ -57,6 +65,8 @@ class Aggregator:
 
         self._countdowns: dict[str, asyncio.Task] = {}
         self._aliases: dict[str, str] = {}  # 別ソースのズレたID -> 正規ID
+        # EEW を伴わない確定情報の収録 (発生時刻キーで続報 551 と重複開始しない)
+        self._info_recordings: dict[str, recorder.Recording] = {}
 
     def set_home(self, lat: float, lon: float, name: str | None = None) -> None:
         """自宅地点を実行中に更新 (地図クリックからの反映用)。"""
@@ -120,7 +130,9 @@ class Aggregator:
         dead = [k for k, st in self.events.items()
                 if st.last_update and (now - st.last_update).total_seconds() > PRUNE_AFTER_SEC]
         for k in dead:
-            self.events.pop(k, None)
+            st = self.events.pop(k, None)
+            if st is not None and st.recording is not None:
+                st.recording.stop()
             task = self._countdowns.pop(k, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -198,6 +210,10 @@ class Aggregator:
             if remaining is None:
                 return
 
+            # S波到達までは収録を延命する (続報が止まっても揺れの到達は映す)
+            if st.recording is not None and remaining > -5:
+                st.recording.touch()
+
             # 地図へは毎秒プッシュ
             self.publish({
                 "type": "countdown",
@@ -267,6 +283,10 @@ class Aggregator:
             if not st.cancelled:
                 st.cancelled = True
                 display.show_eew(ev, is_new=False)
+                eventlog.log_eew(ev, st.estimate, "cancel", None)
+                if st.recording is not None:
+                    st.recording.cancelled = True
+                    st.recording.stop()
                 notifier.notify_eew(ev, self.cfg, "cancel")
                 self._publish_eew(ev, st)
             return
@@ -337,7 +357,28 @@ class Aggregator:
         st.max_intensity_rank = max(st.max_intensity_rank, ev.intensity_rank)
         st.finalized = st.finalized or ev.is_final
 
+        # ---- 地図画面の収録 (最大震度3以上、続報で条件を満たした時点から) ----
+        if st.recording is None:
+            st.recording = recorder.maybe_start(ev.event_id, st.max_intensity_rank)
+        if st.recording is not None:
+            st.recording.touch()
+            st.recording.update_meta(
+                hypocenter=ev.hypocenter or None,
+                magnitude=None if ev.is_assumption else ev.magnitude,
+                intensity_label=(rank_label(st.max_intensity_rank)
+                                 if st.max_intensity_rank >= 0 else None))
+
+        # ---- 震度3以上の専用音の条件 ----
+        est_now = home_est or st.estimate
+        home3 = est_now is not None and est_now.intensity_rank >= RANK_INT3
+        national3 = ev.intensity_rank >= RANK_INT3
+
+        # ---- 永続ログ (後から python -m eew.history で振り返る用) ----
+        eventlog.log_eew(ev, est_now, reason, in_warn_area)
+
         if reason is None:
+            # 通知しない続報でも、続報の上方修正で条件を初めて満たしたら音だけ鳴らす
+            self._play_int3_sound(ev, st, home3, national3)
             return
 
         # 予報の通知フィルタ (警報は常に通知する)
@@ -347,11 +388,108 @@ class Aggregator:
             if self.use_home_intensity and est_filter is not None:
                 # 自宅予想震度ベース: 遠方の地震で鳴らさない
                 if est_filter.intensity_rank < self.forecast_min_rank:
+                    # 通知対象外の遠方でも「全国震度3以上」なら音だけ鳴らす
+                    self._play_int3_sound(ev, st, home3, national3)
                     return
             elif ev.intensity_rank < self.forecast_min_rank:
                 return
 
-        notifier.notify_eew(ev, self.cfg, reason, home_est, in_warn_area)
+        # 予報の通知音を条件に応じて差し替える (警報音はより上位としてそのまま)
+        sound_kind = None
+        if not ev.is_warn:
+            if home3:
+                sound_kind = "home_int3"
+            elif national3:
+                sound_kind = "national_int3"
+        if reason in ("new", "upgrade"):
+            # notify_eew が音を鳴らす場面: 専用音の重複再生を防ぐフラグだけ立てる
+            # (警報時は警報音が鳴るが、上位互換として鳴った扱いにする)
+            if home3:
+                st.sounded_home3 = st.sounded_national3 = True
+            elif national3:
+                st.sounded_national3 = True
+        else:
+            # final はトーストのみで音を鳴らさないため、未達ならここで専用音を補う
+            self._play_int3_sound(ev, st, home3, national3)
+
+        notifier.notify_eew(ev, self.cfg, reason, home_est, in_warn_area, sound_kind)
+
+    def _play_int3_sound(self, ev: EEWEvent, st: _EventState,
+                         home3: bool, national3: bool) -> None:
+        """通知を出さない場面用: 震度3以上の条件を初めて満たしたら音だけ鳴らす。
+
+        自宅到達予定 (home_int3) が全国 (national_int3) を兼ねるため、
+        鳴るのはイベントごとに高々一度ずつ。
+        """
+        sound_on = self.cfg.get("notify", {}).get("sound_enabled", True)
+        if home3 and not st.sounded_home3:
+            st.sounded_home3 = st.sounded_national3 = True
+            display.log_system(
+                f"[{self.home_name}] 震度3以上が到達予定 ({ev.hypocenter})")
+            notifier.play_sound("home_int3", sound_on)
+        elif national3 and not home3 and not st.sounded_national3:
+            st.sounded_national3 = True
+            display.log_system(
+                f"全国で震度3以上 ({ev.hypocenter} 最大震度{ev.max_intensity}) 音のみ",
+                display.DIM)
+            notifier.play_sound("national_int3", sound_on)
+
+    # ----------------------------------------------------------- quake info
+
+    def handle_quake_info(self, info: dict) -> None:
+        """P2P 551 確定情報。EEW が出なかった地震も地図表示・収録の対象にする。
+
+        info: p2p が組み立てた dict (hypocenter/magnitude/depth_km/max_intensity/
+              tsunami/latitude/longitude/origin_time[iso])
+        """
+        # ---- 地図へプッシュ (EEW の有無に関わらず確定値を表示する) ----
+        self.publish({"type": "quake_info", **info,
+                      "server_now": now_jst().isoformat()})
+
+        rank = intensity_rank(info.get("max_intensity"))
+        key = info.get("origin_time") or ""
+
+        # 同じ地震の続報 551 (震度速報 -> 震源情報 -> 詳細) では収録を増やさず
+        # メタデータ (震源名・M・震度) だけ良い値に更新する
+        rec = self._info_recordings.get(key)
+        if rec is not None:
+            rec.update_meta(hypocenter=info.get("hypocenter"),
+                            magnitude=info.get("magnitude"),
+                            intensity_label=info.get("max_intensity"))
+            return
+
+        # 対応する EEW イベントが既にあるか (発生時刻の近接で判定)
+        ot = None
+        if key:
+            try:
+                ot = datetime.fromisoformat(key)
+            except ValueError:
+                pass
+        if ot is not None:
+            for st in self.events.values():
+                le = st.latest
+                if le is None or le.origin_time is None:
+                    continue
+                if abs((ot - le.origin_time).total_seconds()) <= INFO_MATCH_SEC:
+                    if st.recording is not None:
+                        # EEW 側で収録済み/収録中。確定値の方が正確なので名前に反映
+                        st.recording.update_meta(
+                            hypocenter=info.get("hypocenter"),
+                            magnitude=info.get("magnitude"),
+                            intensity_label=info.get("max_intensity"))
+                        return
+                    break  # EEW はあったが収録条件未達 -> 確定値で判定し直す
+
+        rec = recorder.maybe_start(f"info-{key or now_jst().strftime('%H%M%S')}",
+                                   rank, duration=INFO_RECORD_SEC)
+        if rec is not None:
+            rec.update_meta(hypocenter=info.get("hypocenter"),
+                            magnitude=info.get("magnitude"),
+                            intensity_label=info.get("max_intensity"))
+            if key:
+                self._info_recordings[key] = rec
+                if len(self._info_recordings) > 10:  # 常駐時の伸び対策
+                    self._info_recordings.pop(next(iter(self._info_recordings)))
 
     # --------------------------------------------------------- ground motion
 
@@ -363,6 +501,7 @@ class Aggregator:
                     f"{display.YELLOW}揺れ検知(強震モニタ) {gm.region}付近 "
                     f"震度{gm.max_realtime_intensity:.1f}相当 "
                     f"({gm.point_count}観測点){display.RESET}")
+        eventlog.log_ground_motion(gm)
         ncfg = self.cfg.get("notify", {})
         notifier.toast("揺れ検知 (強震モニタ)",
                        f"{gm.region}付近で震度{gm.max_realtime_intensity:.1f}相当の揺れを検知",

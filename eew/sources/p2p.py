@@ -13,7 +13,7 @@ from typing import Callable
 
 import websockets
 
-from .. import display, notifier, region
+from .. import display, eventlog, notifier, region
 from ..models import EEWEvent, intensity_rank, now_jst, p2p_scale_label, parse_jst
 
 URL = "wss://api.p2pquake.net/v2/ws"
@@ -88,10 +88,12 @@ def _parse_556(data: dict) -> EEWEvent | None:
 
 class P2PSource:
     def __init__(self, on_eew: Callable[[EEWEvent], None], cfg: dict,
-                 publish: Callable[[dict], None] | None = None):
+                 publish: Callable[[dict], None] | None = None,
+                 on_quake_info: Callable[[dict], None] | None = None):
         self.on_eew = on_eew
         self.cfg = cfg
         self.publish = publish or (lambda payload: None)
+        self.on_quake_info = on_quake_info  # 確定情報の地図表示・収録 (aggregator)
         self.ncfg = cfg.get("notify", {})
         self.forecast_min_rank = intensity_rank(
             self.ncfg.get("forecast_min_intensity", "3"))
@@ -128,15 +130,55 @@ class P2PSource:
         msg = f"地震情報: {name}{mag_s}{depth_s} 最大震度{label} {tsunami_s}"
         display.log(SOURCE, msg, display.BOLD)
 
+        # 確定値を永続ログへ。観測点別震度は後の予想震度検証に使えるので残す
+        eventlog.log_info({
+            "issue_type": (data.get("issue") or {}).get("type"),
+            "time": eq.get("time"),
+            "hypocenter": name,
+            "magnitude": mag if isinstance(mag, (int, float)) and mag >= 0 else None,
+            "depth_km": depth if isinstance(depth, (int, float)) and depth >= 0 else None,
+            "max_intensity": label,
+            "tsunami": tsunami_s,
+            "points": [{"pref": p.get("pref"), "addr": p.get("addr"),
+                        "scale": p.get("scale"), "is_area": p.get("isArea")}
+                       for p in data.get("points") or [] if isinstance(p, dict)],
+        })
+
+        # EEW が出なかった地震も地図表示・収録の対象にする (aggregator が判断)
+        if self.on_quake_info is not None:
+            def _coord(v):
+                try:
+                    f = float(v)
+                    return f if f > -200 else None  # 欠測センチネルは -200
+                except (ValueError, TypeError):
+                    return None
+            origin = parse_jst(str(eq.get("time", "")), "%Y/%m/%d %H:%M:%S")
+            self.on_quake_info({
+                "hypocenter": name if name != "震源不明" else "",
+                "magnitude": (mag if isinstance(mag, (int, float)) and mag >= 0
+                              else None),
+                "depth_km": (int(depth)
+                             if isinstance(depth, (int, float)) and depth >= 0
+                             else None),
+                "max_intensity": label if label != "不明" else "",
+                "tsunami": tsunami_s,
+                "latitude": _coord(hypo.get("latitude")),
+                "longitude": _coord(hypo.get("longitude")),
+                "origin_time": origin.isoformat() if origin else None,
+            })
+
         rank = intensity_rank(label)
         if rank >= self.forecast_min_rank:
             notifier.toast("地震情報", f"{name}{mag_s} / 最大震度{label} / {tsunami_s}",
                            urgent=False, enabled=self.ncfg.get("toast_enabled", True))
-            notifier.play_sound("info", self.ncfg.get("sound_enabled", True))
+            # 確定値で全国どこかが震度3以上 -> 専用音 (旧: info)
+            notifier.play_sound("national_int3",
+                                self.ncfg.get("sound_enabled", True))
 
     def _handle_552(self, data: dict) -> None:
         if data.get("cancelled"):
             display.log(SOURCE, "津波予報: 解除されました", display.GREEN)
+            eventlog.log_tsunami({}, cancelled=True, home_grade=None)
             notifier.toast("津波予報 解除", "津波予報は解除されました",
                            enabled=self.ncfg.get("toast_enabled", True))
             self.publish({"type": "tsunami", "cancelled": True, "grades": {},
@@ -159,6 +201,7 @@ class P2PSource:
 
         summary = " / ".join(f"{g}: {'、'.join(names[:6])}" for g, names in grades.items())
         display.log(SOURCE, f"{display.WHITE_ON_RED}【津波予報】{display.RESET} {summary}")
+        eventlog.log_tsunami(grades, cancelled=False, home_grade=home_grade)
 
         # 行動指示は段階で変える (注意報に「高台へ避難」は過剰)
         def _action(grade):

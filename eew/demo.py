@@ -3,6 +3,7 @@
 実行:  python -m eew.demo                        (三陸沖 M8.8 深さ10km)
        python -m eew.demo 9.4 30                 (M・深さ指定)
        python -m eew.demo 7.9 25 sagami          (震源プリセット指定)
+       python -m eew.demo info                   (EEWなし・確定情報のみの地震)
 
 プリセット: sanriku (三陸沖・海溝型) / sagami (相模湾北西部・関東直下型)
 
@@ -278,6 +279,42 @@ async def amain(mag: float, depth: float, preset_key: str) -> None:
     display.log_system("デモ終了 (地図タブは閉じて構いません)")
 
 
+async def amain_info() -> None:
+    """EEW を伴わない地震のデモ: 確定の地震情報 (551) だけが届くケース。
+
+    震度3〜4程度では EEW が発表されないことが多く、その場合も地図表示
+    (橙の震央マーカー + 確定値パネル) されることを確認する。
+    本番では震度3以上なら地図画面の動画収録も行われる (デモでは収録しない)。
+    """
+    display.banner()
+    display.log_system(
+        "=== デモ: EEWなし・確定情報のみ 石川県能登地方 M5.4 最大震度4 "
+        "(実際の地震ではありません) ===", display.YELLOW)
+    cfg, mapsrv, agg = await _setup()
+    mapsrv.open_browser(force=True)  # 警報が出ないデモなので最初から地図を開く
+    display.log_system("地図を開きました。5秒後に確定情報が届きます")
+    await asyncio.sleep(5)
+
+    p2p_demo = P2PSource(agg.handle_eew, cfg, publish=mapsrv.broadcast,
+                         on_quake_info=agg.handle_quake_info)
+    p2p_demo.handle({
+        "code": 551,
+        "issue": {"type": "DetailScale"},
+        "earthquake": {
+            "time": now_jst().strftime("%Y/%m/%d %H:%M:%S"),
+            "maxScale": 40,
+            "domesticTsunami": "None",
+            "hypocenter": {"name": "石川県能登地方", "magnitude": 5.4,
+                           "depth": 10, "latitude": 37.5, "longitude": 137.2},
+        },
+        "points": [{"pref": "石川県", "addr": "輪島市", "scale": 40,
+                    "isArea": False}],
+    })
+    display.log_system("地図に橙の震央マーカーと確定値パネルが出ます (表示は10分で自動消去)")
+    await asyncio.sleep(60)
+    display.log_system("デモ終了 (地図タブは閉じて構いません)")
+
+
 MULTI_SCENARIOS = {
     # (遅延秒, M, 深さ, プリセット, イベントID接尾辞, 津波あり?)
     "double": [
@@ -334,6 +371,15 @@ async def amain_multi(mode: str) -> None:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "info":
+        try:
+            asyncio.run(amain_info())
+        except OSError as e:
+            print(f"起動失敗: 前のデモがまだ実行中の可能性があります ({e})", flush=True)
+            sys.exit(1)
+        except KeyboardInterrupt:
+            print("\nデモ中断", flush=True)
+        return
     if len(sys.argv) > 1 and sys.argv[1] in MULTI_SCENARIOS:
         try:
             asyncio.run(amain_multi(sys.argv[1]))

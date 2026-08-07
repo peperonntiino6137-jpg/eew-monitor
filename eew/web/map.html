@@ -42,6 +42,8 @@
   .note { font-size: 12px; color: #8a8f98; margin-top: 8px; }  /* AA 4.5:1 以上 */
   .epi-icon { color: #ff3b30; font-size: 30px; font-weight: bold; text-shadow: 0 0 6px #000;
               line-height: 30px; text-align: center; }
+  .qi-icon { color: #ff9f0a; font-size: 26px; font-weight: bold; text-shadow: 0 0 6px #000;
+             line-height: 26px; text-align: center; }  /* 確定情報の震央 (橙) */
   .gm-icon { width: 18px; height: 18px; border-radius: 50%; background: rgba(255,204,0,.85);
              border: 2px solid #ff9500; animation: pulse 1s infinite; }
   @keyframes pulse { 50% { transform: scale(1.6); opacity: .5; } }
@@ -246,6 +248,8 @@ function onIntensityGrid(msg) {
 
 const $ = id => document.getElementById(id);
 let home = null, homeMarker = null, gmMarker = null;
+let quakeInfo = null, qiMarker = null;  // 確定情報 (EEW を伴わない地震も表示)
+const QUAKE_INFO_TTL_MS = 600000;       // 確定情報の表示保持 (10分)
 let sock = null;                 // WebSocket (自宅設定の送信用)
 let homeSetByUser = false;       // 設定直後はビューを動かさない
 let clockOffset = 0;             // serverNow - Date.now() (PC時計ズレ補正)
@@ -411,10 +415,25 @@ function animateWaves() {
 function renderPanel() {
   const id = selectEvent();
   if (!id) {
-    $("title").textContent = "待機中";
-    $("detail").textContent = disconnectedAt
-      ? "サーバとの接続が切れています。再接続を試行中..."
-      : "緊急地震速報を受信するとここに表示されます。";
+    // 進行中の EEW が無ければ、直近の確定情報 (EEW を伴わない地震を含む) を表示
+    const qi = quakeInfo && Date.now() - quakeInfo.at < QUAKE_INFO_TTL_MS
+      ? quakeInfo.msg : null;
+    if (qi && !disconnectedAt) {
+      $("title").textContent = "地震情報 (確定値)";
+      const parts = [];
+      if (qi.hypocenter) parts.push(qi.hypocenter);
+      if (qi.magnitude != null) parts.push(`M${qi.magnitude.toFixed(1)}`);
+      if (qi.depth_km != null)
+        parts.push(qi.depth_km === 0 ? "ごく浅い" : `深さ${qi.depth_km}km`);
+      if (qi.max_intensity) parts.push(`最大震度${qi.max_intensity}`);
+      if (qi.tsunami) parts.push(qi.tsunami);
+      $("detail").textContent = parts.join(" / ") || "詳細情報なし";
+    } else {
+      $("title").textContent = "待機中";
+      $("detail").textContent = disconnectedAt
+        ? "サーバとの接続が切れています。再接続を試行中..."
+        : "緊急地震速報を受信するとここに表示されます。";
+    }
     $("verdict").style.display = "none";
     $("countdown-box").style.display = "none";
     $("countdown").textContent = "--";
@@ -513,7 +532,7 @@ map.on("zoomstart dragstart", () => {
 
 function autoFit(force = false) {
   if (tsunamiMode) return;  // 津波モード中は津波地図の縮尺を維持
-  if (events.size === 0) return;
+  if (events.size === 0 && !qiMarker) return;
   if (!force && Date.now() - lastUserInteract < 20000) return;
   const pts = [];
   for (const ev of events.values()) {
@@ -526,6 +545,10 @@ function autoFit(force = false) {
       const b = ev.sCircle.getBounds();
       pts.push([b.getNorth(), b.getEast()], [b.getSouth(), b.getWest()]);
     }
+  }
+  if (qiMarker) {  // 確定情報の震央 (EEW を伴わない地震)
+    const ll = qiMarker.getLatLng();
+    pts.push([ll.lat, ll.lng]);
   }
   if (home && home.latitude != null) pts.push([home.latitude, home.longitude]);
   if (pts.length === 0) return;
@@ -553,10 +576,16 @@ function tick() {
     pendingGrid = null;
     if (gmMarker) { map.removeLayer(gmMarker); gmMarker = null; }
     $("gm-note").style.display = "none";
+    dropQuakeInfo();
     if (events.size > 0) {
       for (const id of [...events.keys()]) dropEvent(id);
       renderPanel();
     }
+  }
+  // 確定情報の表示期限
+  if (quakeInfo && Date.now() - quakeInfo.at > QUAKE_INFO_TTL_MS) {
+    dropQuakeInfo();
+    renderPanel();
   }
   for (const [id, ev] of [...events]) {
     const t = ev.msg.origin_time ? new Date(ev.msg.origin_time).getTime() : null;
@@ -648,6 +677,15 @@ function setEventLayersVisible(visible) {
       }).addTo(map);
     }
   }
+  // 確定情報の震央も EEW と同様に隠す/戻す
+  if (!visible) {
+    if (qiMarker) { map.removeLayer(qiMarker); qiMarker = null; }
+  } else if (quakeInfo && quakeInfo.msg.latitude != null && !qiMarker
+             && Date.now() - quakeInfo.at < QUAKE_INFO_TTL_MS) {
+    qiMarker = L.marker([quakeInfo.msg.latitude, quakeInfo.msg.longitude], {
+      icon: L.divIcon({ className: "qi-icon", html: "✕", iconSize: [26, 26] })
+    }).addTo(map);
+  }
 }
 
 function enterTsunamiMode() {
@@ -731,6 +769,27 @@ function renderTsunamiBanner() {
   b.style.display = "block";
 }
 
+// ---- 確定の地震情報 (P2P 551): EEW を伴わない地震もここで地図に載る ----
+function onQuakeInfo(msg) {
+  noteServerNow(msg);
+  quakeInfo = { msg, at: Date.now() };
+  if (qiMarker) { map.removeLayer(qiMarker); qiMarker = null; }
+  if (msg.latitude != null && msg.longitude != null && !tsunamiMode) {
+    qiMarker = L.marker([msg.latitude, msg.longitude], {
+      icon: L.divIcon({ className: "qi-icon", html: "✕", iconSize: [26, 26] })
+    }).addTo(map).bindPopup(
+      `地震情報(確定): ${msg.hypocenter || "震源不明"}`
+      + (msg.max_intensity ? ` 最大震度${msg.max_intensity}` : ""));
+    autoFit(true);  // 新規 EEW と同様に強制フィット (震央を確実に画面へ)
+  }
+  renderPanel();
+}
+
+function dropQuakeInfo() {
+  quakeInfo = null;
+  if (qiMarker) { map.removeLayer(qiMarker); qiMarker = null; }
+}
+
 function onGroundMotion(msg) {
   $("gm-note").style.display = "block";
   $("gm-note").textContent =
@@ -747,10 +806,14 @@ function onGroundMotion(msg) {
 
 // タブの表示状態 (前面/背面) をサーバへ報告する。
 // 「見えているタブが無ければ警報時に新しいタブを開く」判定に使われる。
+// 収録用ヘッドレスページ (?rec=1) は常に「見えていない」扱いにする
+// (ユーザーのブラウザ自動オープンを妨げないため)。
+const IS_RECORDER = new URLSearchParams(location.search).has("rec");
 function sendVisibility() {
   if (sock && sock.readyState === WebSocket.OPEN) {
     sock.send(JSON.stringify({ type: "visibility",
-                               visible: document.visibilityState === "visible" }));
+                               visible: !IS_RECORDER
+                                        && document.visibilityState === "visible" }));
   }
 }
 document.addEventListener("visibilitychange", sendVisibility);
@@ -768,6 +831,7 @@ function connect() {
     else if (msg.type === "eew") onEEW(msg);
     else if (msg.type === "countdown") onCountdown(msg);
     else if (msg.type === "ground_motion") onGroundMotion(msg);
+    else if (msg.type === "quake_info") onQuakeInfo(msg);
     else if (msg.type === "intensity_grid") onIntensityGrid(msg);
     else if (msg.type === "tsunami") onTsunami(msg);
     else if (msg.type === "time") noteServerNow(msg);

@@ -11,7 +11,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import display, location, notifier, region, timesync
+from . import display, eventlog, location, notifier, recorder, region, timesync
 from .aggregator import Aggregator
 from .mapserver import AlreadyRunningError, MapServer
 from .sources import kmoni, kmoni_image, p2p, wolfx
@@ -28,7 +28,8 @@ DEFAULT_CONFIG = {
         "sound_enabled": True,
         "use_home_intensity": True,
         "sounds": {"warning": "", "forecast": "", "tsunami": "",
-                   "tsunami_watch": "", "info": ""},
+                   "tsunami_watch": "", "info": "",
+                   "home_int3": "", "national_int3": ""},
     },
     "sources": {"wolfx": True, "kmoni": True, "p2p": True},
     "home": {"auto_locate": True, "name": "", "latitude": None,
@@ -37,6 +38,7 @@ DEFAULT_CONFIG = {
             "open_on_start": True, "open_on_warning": True},
     "kmoni_image": {"enabled": True, "trigger_intensity": 2.5, "min_points": 3,
                     "cluster_km": 50, "cooldown_seconds": 60},
+    "recording": {"enabled": True, "min_intensity": "3", "max_seconds": 300},
     "stale_seconds": 180,
 }
 
@@ -52,7 +54,7 @@ def load_config() -> dict:
                            display.YELLOW)
         return json.loads(json.dumps(DEFAULT_CONFIG))
     merged = {**DEFAULT_CONFIG, **cfg}
-    for key in ("notify", "sources", "home", "map", "kmoni_image"):
+    for key in ("notify", "sources", "home", "map", "kmoni_image", "recording"):
         merged[key] = {**DEFAULT_CONFIG[key], **(cfg.get(key) or {})}
     return merged
 
@@ -74,6 +76,8 @@ async def amain(headless: bool = False) -> None:
     cfg = load_config()
     display.banner()
     notifier.configure(cfg)  # カスタム音源の読み込み
+    # 実際の地震の永続ログ (python -m eew.history で閲覧)
+    eventlog.enable(ROOT / "logs" / "events")
 
     await location.resolve_home(cfg, save_config)
 
@@ -92,6 +96,9 @@ async def amain(headless: bool = False) -> None:
             # 常駐起動のたびにブラウザを開かない (警報時のみ開く)
             mapsrv.open_on_start = False
         await mapsrv.start()
+
+    # 震度3以上の地震の地図画面収録 (logs/ に webm 保存)
+    recorder.configure(cfg, mapsrv.url if mapsrv else None)
 
     agg = Aggregator(cfg, publish=mapsrv.broadcast if mapsrv else None)
 
@@ -164,7 +171,8 @@ async def amain(headless: bool = False) -> None:
         tasks.append(asyncio.create_task(
             supervised("p2p", lambda: p2p.P2PSource(
                 agg.handle_eew, cfg,
-                mapsrv.broadcast if mapsrv else None).run()),
+                mapsrv.broadcast if mapsrv else None,
+                on_quake_info=agg.handle_quake_info).run()),
             name="p2p"))
 
     display.log_system(f"受信開始: {', '.join(t.get_name() for t in tasks)}")

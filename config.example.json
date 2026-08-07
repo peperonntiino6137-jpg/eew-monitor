@@ -10,8 +10,15 @@
             "forecast": "sounds/forecast.wav",
             "tsunami": "sounds/tsunami.wav",
             "tsunami_watch": "sounds/tsunami_watch.wav",
-            "info": "sounds/info.wav"
+            "info": "sounds/info.wav",
+            "home_int3": "sounds/震度3以上到達予定.wav",
+            "national_int3": "sounds/全国震度3以上.wav"
         }
+    },
+    "recording": {
+        "enabled": true,
+        "min_intensity": "3",
+        "max_seconds": 300
     },
     "sources": {
         "wolfx": true,

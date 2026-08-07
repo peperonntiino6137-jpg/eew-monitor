@@ -26,6 +26,7 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 OPEN_DEBOUNCE_SEC = 60     # ブラウザ起動〜WS接続完了前の続報でタブを増やさない
 REPLAY_MAX_AGE_SEC = 600   # これより古い EEW は新規接続クライアントに再送しない
 TSUNAMI_REPLAY_MAX_AGE_SEC = 3600  # 津波予報は長時間有効なので長めに再送する
+QUAKE_INFO_REPLAY_MAX_AGE_SEC = 600  # 確定情報の再送期限 (収録用ページの後追い接続向け)
 
 
 class AlreadyRunningError(Exception):
@@ -80,6 +81,8 @@ class MapServer:
         self._active_eew: dict[str, tuple[dict, float]] = {}  # id -> (payload, monotonic)
         self._last_tsunami: dict | None = None
         self._last_tsunami_at: float = 0.0
+        self._last_quake_info: dict | None = None
+        self._last_quake_info_at: float = 0.0
         self._last_open_at: float = -1e9   # タブ増殖防止デバウンス (monotonic)
         self._send_tasks: set = set()      # 送信タスクの強参照 (GC回収対策)
         # 地図クリックで自宅を設定したときのコールバック (main が設定)
@@ -149,6 +152,15 @@ class MapServer:
                     and time.monotonic() - self._last_tsunami_at
                     < TSUNAMI_REPLAY_MAX_AGE_SEC):
                 await ws.send(json.dumps(self._last_tsunami, ensure_ascii=False))
+            # 直近の確定情報も再送 (収録用ページは発表後に接続してくるため必須)
+            # server_now はクライアント時計を巻き戻さないよう現在時刻に差し替える
+            if (self._last_quake_info is not None
+                    and time.monotonic() - self._last_quake_info_at
+                    < QUAKE_INFO_REPLAY_MAX_AGE_SEC):
+                await ws.send(json.dumps(
+                    {**self._last_quake_info,
+                     "server_now": now_jst().isoformat()},
+                    ensure_ascii=False))
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
@@ -193,6 +205,9 @@ class MapServer:
                       or home_rank >= self.open_min_home_rank)
             if urgent and not payload.get("is_cancel"):
                 self.maybe_open_on_warning()
+        elif payload.get("type") == "quake_info":
+            self._last_quake_info = payload
+            self._last_quake_info_at = time.monotonic()
         elif payload.get("type") == "tsunami":
             if payload.get("cancelled"):
                 self._last_tsunami = None

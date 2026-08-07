@@ -124,6 +124,10 @@ _PATTERNS = {
     "tsunami": ([(523, 400), (392, 400)], 3),
     # 津波注意報: 中程度のチャイム (info より明確に強く、警報よりは控えめ)
     "tsunami_watch": ([(523, 300), (659, 300)], 2),
+    # 自宅に震度3以上が到達予定: 予報音と同等の扱い
+    "home_int3": ([(660, 150), (880, 200)], 2),
+    # 全国どこかで震度3以上 (自宅は3未満): 短い気づき音
+    "national_int3": ([(988, 150)], 1),
     # 確定情報など: 短い 1 音
     "info": ([(740, 180)], 1),
 }
@@ -135,7 +139,9 @@ def _beep_for(kind: str) -> None:
 
 
 def play_sound(kind: str, enabled: bool = True) -> None:
-    """kind: 'warning' | 'forecast' | 'info' | 'tsunami' | 'tsunami_watch'"""
+    """kind: 'warning' | 'forecast' | 'info' | 'tsunami' | 'tsunami_watch'
+             | 'home_int3' (自宅に震度3以上到達予定)
+             | 'national_int3' (全国で震度3以上・自宅は対象外)"""
     if not enabled:
         return
     # カスタム音源があればそれを再生 (WAV/MP3)。MCI 失敗時は内蔵ビープに退避
@@ -176,11 +182,13 @@ def toast(title: str, message: str, urgent: bool = False, enabled: bool = True) 
 
 
 def notify_eew(ev: EEWEvent, cfg: dict, reason: str, home_est=None,
-               in_warn_area: bool | None = None) -> None:
+               in_warn_area: bool | None = None,
+               sound_kind: str | None = None) -> None:
     """EEW をトースト+音で通知する。reason: 'new' | 'upgrade' | 'final' | 'cancel'
 
     home_est: estimate.HomeEstimate (あれば自宅予想震度・到達秒数を本文に含める)
     in_warn_area: 自宅都道府県が警報対象地域か (不明は None)
+    sound_kind: 既定の warning/forecast の代わりに鳴らす音 (Aggregator が指定)
     """
     ncfg = cfg.get("notify", {})
     sound_on = ncfg.get("sound_enabled", True)
@@ -218,4 +226,4 @@ def notify_eew(ev: EEWEvent, cfg: dict, reason: str, home_est=None,
     toast(f"{title_prefix}緊急地震速報({kind})", body, urgent=ev.is_warn, enabled=toast_on)
 
     if reason in ("new", "upgrade"):
-        play_sound("warning" if ev.is_warn else "forecast", sound_on)
+        play_sound(sound_kind or ("warning" if ev.is_warn else "forecast"), sound_on)
